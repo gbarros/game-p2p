@@ -1,0 +1,19 @@
+{
+  "name": "game-p2p-monorepo",
+  "version": "0.0.1",
+  "description": "Monorepo for PeerJS Overlay Protocol and Example Site",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "dev": "npm run dev --workspaces --if-present"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3",
+    "vitest": "^1.1.0"
+  }
+}

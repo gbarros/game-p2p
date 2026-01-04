@@ -1,0 +1,26 @@
+{
+    "name": "@game-p2p/protocol",
+    "version": "1.0.0",
+    "description": "PeerJS Overlay Network Protocol",
+    "main": "dist/index.js",
+    "module": "dist/index.mjs",
+    "types": "dist/index.d.ts",
+    "scripts": {
+        "build": "tsup src/index.ts --format cjs,esm --dts",
+        "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
+        "test": "vitest"
+    },
+    "peerDependencies": {
+        "peerjs": "^1.5.0"
+    },
+    "devDependencies": {
+        "@types/uuid": "^10.0.0",
+        "peerjs": "^1.5.2",
+        "tsup": "^8.0.0",
+        "typescript": "^5.3.3",
+        "vitest": "^1.1.0"
+    },
+    "dependencies": {
+        "uuid": "^13.0.0"
+    }
+}

@@ -81,12 +81,13 @@ export class Host {
             return;
         }
 
+        // Register data handler immediately to avoid dropping messages sent on peer open.
         conn.on('data', (data) => {
             this.handleMessage(conn, data as ProtocolMessage);
         });
 
         conn.on('open', () => {
-            console.log('New connection:', conn.peer);
+            console.log('New connection2:', conn.peer);
         });
 
         conn.on('error', (err) => {

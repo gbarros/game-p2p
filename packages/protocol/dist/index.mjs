@@ -44,11 +44,11 @@ var Host = class {
       conn.close();
       return;
     }
-    conn.on("data", (data) => {
-      this.handleMessage(conn, data);
-    });
     conn.on("open", () => {
-      console.log("New connection:", conn.peer);
+      console.log("New connection2:", conn.peer);
+      conn.on("data", (data) => {
+        this.handleMessage(conn, data);
+      });
     });
     conn.on("error", (err) => {
       console.error(`[Host] Connection error with ${conn.peer}:`, err);
@@ -602,6 +602,10 @@ var Node = class {
     this.peer.on("error", (err) => {
       this.log(`[Node] Peer Error: ${err}`);
     });
+    this.peer.on("connection", (conn) => {
+      console.log(`[Node] Incoming connection: ${conn.peer}`, this.peer.id);
+      this.handleIncomingConnection(conn);
+    });
   }
   // --- Simulation Controls ---
   setLogger(logger) {
@@ -671,6 +675,7 @@ var Node = class {
     });
     this.log(`[Node] Connection object created, peer: ${conn.peer}, open: ${conn.open}`);
     const onOpen = () => {
+      this.log("[Node] Host p2p connection open, sending JOIN_REQUEST...");
       const req = {
         t: "JOIN_REQUEST",
         v: 1,
@@ -1245,17 +1250,19 @@ var Node = class {
       this.log(`[Node] Registered incoming COUSIN connection from ${conn.peer}`);
       this.cousins.set(conn.peer, conn);
     }
-    conn.on("data", (data) => {
-      if (this._paused) return;
-      const msg = data;
-      if (msg.t === "ATTACH_REQUEST") {
-        this.handleIncomingAttach(conn, msg);
-      } else if (msg.t === "SUBTREE_STATUS") {
-        this.childDescendants.set(conn.peer, msg.descendants || []);
-        this.childCapacities.set(conn.peer, msg.freeSlots);
-      } else {
-        this.handleMessage(conn, msg);
-      }
+    conn.on("open", () => {
+      conn.on("data", (data) => {
+        if (this._paused) return;
+        const msg = data;
+        if (msg.t === "ATTACH_REQUEST") {
+          this.handleIncomingAttach(conn, msg);
+        } else if (msg.t === "SUBTREE_STATUS") {
+          this.childDescendants.set(conn.peer, msg.descendants || []);
+          this.childCapacities.set(conn.peer, msg.freeSlots);
+        } else {
+          this.handleMessage(conn, msg);
+        }
+      });
     });
     conn.on("close", () => {
       this.log(`[Node] Connection closed: ${conn.peer}`);

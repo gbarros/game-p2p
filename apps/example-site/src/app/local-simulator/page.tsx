@@ -61,7 +61,7 @@ export default function LocalSimulatorPage() {
                 }
                 return n;
             }));
-            console.log(`[${config.id}][${time}] ${msg}`);
+            console.log(`[${config.peerId}][${time}] ${msg}`);
         };
 
         // Pass existing peerId to constructor to ensure identity persistence
@@ -189,8 +189,7 @@ export default function LocalSimulatorPage() {
 
     const burstNodes = useCallback((count: number) => {
         for (let i = 0; i < count; i++) {
-            // Increased delay to avoid potential WebRTC/ICE issues with rapid connections
-            setTimeout(() => addNode(), i * 2000);
+            setTimeout(() => addNode(), i * 300);
         }
     }, [addNode]);
 

@@ -104,10 +104,13 @@ export class Node {
             this.log(`[Node] Peer Error: ${err}`);
         });
 
-        // this.peer.on('connection', (conn) => {
-        //     console.log(`[Node] Incoming connection: ${conn.peer}`, this.peer.id);
-        //     this.handleIncomingConnection(conn);
-        // });
+        this.peer.on('connection', (conn) => {
+            this.log(`[Node] Incoming connection: ${conn.peer}`, this.peer.id, JSON.stringify(conn.metadata));
+            this.handleIncomingConnection(conn);
+        });
+
+        // Start stall detection early so tests that manually set state/parent still tick.
+        this.startStallDetection();
     }
 
     // --- Simulation Controls ---
@@ -157,6 +160,8 @@ export class Node {
         // Stop any intervals
         if (this.subtreeInterval) clearInterval(this.subtreeInterval);
         if (this.stallDetectionInterval) clearInterval(this.stallDetectionInterval);
+        this.subtreeInterval = null;
+        this.stallDetectionInterval = null;
         // Close peer connection
         this.peer.destroy();
     }
@@ -198,6 +203,7 @@ export class Node {
         this.log(`[Node] Connection object created, peer: ${conn.peer}, open: ${conn.open}`);
 
         const onOpen = () => {
+            this.log('[Node] Host p2p connection open, sending JOIN_REQUEST...');
             const req: JoinRequest = {
                 t: 'JOIN_REQUEST',
                 v: 1,
@@ -535,7 +541,7 @@ export class Node {
                     }
 
                     this.reqStateTarget = null;
-                    // this.emitState();
+                    this.emitState();
 
                     const currentPath = msg.path ? [...msg.path] : [];
                     if (!currentPath.includes(this.peer.id)) {
@@ -882,6 +888,7 @@ export class Node {
 
     // --- Subtree Reporting ---
     private startSubtreeReporting() {
+        if (this.subtreeInterval) return;
         this.subtreeInterval = setInterval(() => {
             if (this.parent && this.parent.open) {
                 this.reportSubtree();
@@ -919,6 +926,13 @@ export class Node {
             }
         });
 
+        const reportedChildren = Array.from(this.childDescendants.keys()).filter((id) => this.children.has(id)).length;
+        let totalDescendants = 0;
+        this.childDescendants.forEach((list) => {
+            totalDescendants += list.length;
+        });
+        const subtreeCount = 1 + reportedChildren + totalDescendants;
+
         const msg: SubtreeStatus = {
             t: 'SUBTREE_STATUS',
             v: 1,
@@ -928,7 +942,7 @@ export class Node {
             lastRainSeq: this.rainSeq,
             state: 'OK',
             children: myChildrenStatus,
-            subtreeCount: myDescendants.length,
+            subtreeCount: subtreeCount,
             descendants: myDescendants,
             freeSlots: this.MAX_CHILDREN - this.children.size,
             path: [this.peer.id]
@@ -950,6 +964,7 @@ export class Node {
             this.cousins.set(conn.peer, conn);
         }
 
+        // Register data handler immediately to avoid race with early messages.
         conn.on('data', (data) => {
             if (this._paused) return; // Ignore incoming messages when paused
             const msg = data as ProtocolMessage;
@@ -1121,6 +1136,10 @@ export class Node {
 
         if (targetConn && targetConn.open) {
             targetConn.send(msg);
+        } else if (sourceConn.open) {
+            // Fallback to the incoming connection when route lookup fails.
+            this.log(`[Node] Cannot route reply - next hop ${nextHopId} not connected. Falling back to sourceConn.`);
+            sourceConn.send(msg);
         } else {
             this.log(`[Node] Cannot route reply - next hop ${nextHopId} not connected. Route: ${JSON.stringify(msg.route)}`);
         }
@@ -1207,6 +1226,7 @@ export class Node {
     }
 
     private startStallDetection() {
+        if (this.stallDetectionInterval) return;
         this.stallDetectionInterval = setInterval(() => {
             if (this.state === NodeState.REBINDING || (this as any).state === 'REBINDING') {
                 if (!this.isAttached) {
@@ -1348,7 +1368,7 @@ export class Node {
         // Calculate total subtree size (children + descendants)
         let totalDescendants = 0;
         this.childDescendants.forEach(list => totalDescendants += list.length);
-        const totalSubtree = this.children.size + totalDescendants;
+        const totalSubtree = 1 + this.children.size + totalDescendants;
 
         const rebindReq: ProtocolMessage = {
             t: 'REBIND_REQUEST',

@@ -21,3 +21,4 @@ export {
     createReqPayloadMessage,
     addToPath
 } from './messageBuilder.js';
+export { PROTOCOL_CONSTANTS } from './constants.js';

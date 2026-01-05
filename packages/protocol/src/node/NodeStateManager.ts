@@ -1,4 +1,5 @@
 import { NodeState } from '../Node.js';
+import { PROTOCOL_CONSTANTS } from '../utils/index.js';
 
 export class NodeStateManager {
     private _state: NodeState = NodeState.NORMAL;
@@ -9,7 +10,7 @@ export class NodeStateManager {
     private _isAttached: boolean = false;
 
     // Configuration
-    private readonly STALL_THRESHOLD = 3000;
+    private readonly STALL_THRESHOLD = PROTOCOL_CONSTANTS.STALL_THRESHOLD;
 
     constructor(private log: (msg: string) => void) { }
 
@@ -110,8 +111,8 @@ export class NodeStateManager {
     public getHealthStatus(): 'HEALTHY' | 'DEGRADED' | 'OFFLINE' {
         if (!this._isAttached) return 'OFFLINE';
         const timeSinceRain = Date.now() - this._lastRainTime;
-        if (timeSinceRain > 5000) return 'OFFLINE'; // > 5s no rain
-        if (timeSinceRain > 2000) return 'DEGRADED'; // > 2s no rain
+        if (timeSinceRain > PROTOCOL_CONSTANTS.HEALTH_CHECK_OFFLINE) return 'OFFLINE'; // > 5s no rain
+        if (timeSinceRain > PROTOCOL_CONSTANTS.HEALTH_CHECK_DEGRADED) return 'DEGRADED'; // > 2s no rain
         return 'HEALTHY';
     }
 }

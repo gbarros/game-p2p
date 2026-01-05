@@ -24,7 +24,8 @@ import {
     createReqStateMessage,
     createGameCmd,
     createReqPayloadMessage,
-    addToPath
+    addToPath,
+    PROTOCOL_CONSTANTS
 } from './utils/index.js';
 import { NodeStateManager } from './node/NodeStateManager.js';
 import { NodeConnectionManager } from './node/NodeConnectionManager.js';
@@ -54,7 +55,7 @@ export class Node {
     private childDescendants: Map<string, { id: string, hops: number, freeSlots: number }[]> = new Map();
     private childCapacities: Map<string, number> = new Map();
 
-    private MAX_CHILDREN = 3;
+    private MAX_CHILDREN = PROTOCOL_CONSTANTS.MAX_NODE_CHILDREN;
 
     private subtreeInterval: NodeJS.Timeout | null = null;
     private myDepth: number = 0;
@@ -74,8 +75,8 @@ export class Node {
     private rebindJitter: number = 0; // Random jitter (0-10s) for rebind timing to avoid storms
 
     // Join robustness
-    private readonly MAX_ATTACH_ATTEMPTS = 10;
-    private readonly MAX_REDIRECT_DEPTH = 5;
+    private readonly MAX_ATTACH_ATTEMPTS = PROTOCOL_CONSTANTS.MAX_ATTACH_ATTEMPTS;
+    private readonly MAX_REDIRECT_DEPTH = PROTOCOL_CONSTANTS.MAX_REDIRECT_DEPTH;
     private attachAttempts: number = 0;
     private redirectDepth: number = 0;
     private attachRetryTimer: NodeJS.Timeout | null = null;
@@ -103,10 +104,15 @@ export class Node {
         this.connManager = new NodeConnectionManager(peer, (msg) => this.log(msg));
 
         // Initialize utility classes
-        this.dedupCache = new DeduplicationCache(100);
-        this.rateLimiter = new RateLimiter(5, 10000, 30000);
-        this.gameEventCache = new GameEventCache(50);
-        this.ackTracker = new PendingAckTracker(10000);
+        // Initialize utility classes
+        this.dedupCache = new DeduplicationCache(PROTOCOL_CONSTANTS.DEDUP_CACHE_SIZE);
+        this.rateLimiter = new RateLimiter(
+            PROTOCOL_CONSTANTS.RATE_LIMIT_TOKENS,
+            PROTOCOL_CONSTANTS.RATE_LIMIT_WINDOW,
+            PROTOCOL_CONSTANTS.RATE_LIMIT_BAN
+        );
+        this.gameEventCache = new GameEventCache(PROTOCOL_CONSTANTS.GAME_EVENT_CACHE_SIZE_NODE);
+        this.ackTracker = new PendingAckTracker(PROTOCOL_CONSTANTS.ACK_TRACKER_TIMEOUT);
 
         this.peer.on('open', (id) => {
             this.log(`[Node] Peer Open: ${id}`);
@@ -796,7 +802,7 @@ export class Node {
             if (this.connManager.parent && this.connManager.parent.open) {
                 this.reportSubtree();
             }
-        }, 5000);
+        }, PROTOCOL_CONSTANTS.SUBTREE_REPORT_INTERVAL);
     }
 
     private reportSubtree() {

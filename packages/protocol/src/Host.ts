@@ -21,6 +21,7 @@ import {
     createGameEvent
 } from './utils/index.js';
 import { TopologyManager } from './host/TopologyManager.js';
+import { PROTOCOL_CONSTANTS } from './utils/index.js';
 
 export class Host {
     private peer: Peer;
@@ -50,10 +51,15 @@ export class Host {
         this.peer = peer;
 
         // Initialize utility classes
-        this.dedupCache = new DeduplicationCache(100);
-        this.rateLimiter = new RateLimiter(5, 10000, 30000);
-        this.gameEventCache = new GameEventCache(100);
-        this.ackTracker = new PendingAckTracker(10000);
+        // Initialize utility classes
+        this.dedupCache = new DeduplicationCache(PROTOCOL_CONSTANTS.DEDUP_CACHE_SIZE);
+        this.rateLimiter = new RateLimiter(
+            PROTOCOL_CONSTANTS.RATE_LIMIT_TOKENS,
+            PROTOCOL_CONSTANTS.RATE_LIMIT_WINDOW,
+            PROTOCOL_CONSTANTS.RATE_LIMIT_BAN
+        );
+        this.gameEventCache = new GameEventCache(PROTOCOL_CONSTANTS.GAME_EVENT_CACHE_SIZE_HOST);
+        this.ackTracker = new PendingAckTracker(PROTOCOL_CONSTANTS.ACK_TRACKER_TIMEOUT);
 
         // Initialize Topology Manager
         this.topologyManager = new TopologyManager(this.children);
@@ -213,7 +219,7 @@ export class Host {
             case 'JOIN_REQUEST':
                 console.log(`[Host] Accepted join from ${conn.peer}`);
 
-                const hasSpace = this.children.size < 5;
+                const hasSpace = this.children.size < PROTOCOL_CONSTANTS.MAX_HOST_CHILDREN;
                 const seeds = this.topologyManager.getSmartSeeds();
 
                 const accept: JoinAccept = {
@@ -252,7 +258,7 @@ export class Host {
 
             case 'ATTACH_REQUEST':
                 console.log(`[Host] ATTACH_REQUEST from ${conn.peer}`);
-                if (this.children.size >= 5) {
+                if (this.children.size >= PROTOCOL_CONSTANTS.MAX_HOST_CHILDREN) {
                     const reject: AttachReject = {
                         t: 'ATTACH_REJECT',
                         v: 1,
@@ -282,7 +288,7 @@ export class Host {
                         parentId: this.peer.id,
                         level: 0,
                         cousinCandidates: [],
-                        childrenMax: 5,
+                        childrenMax: PROTOCOL_CONSTANTS.MAX_HOST_CHILDREN,
                         childrenUsed: this.children.size,
                         path: [this.peer.id]
                     };
@@ -411,7 +417,7 @@ export class Host {
                 path: [this.peer.id]
             };
             this.broadcast(rain);
-        }, 1000);
+        }, PROTOCOL_CONSTANTS.RAIN_INTERVAL);
     }
 
     private broadcast(msg: ProtocolMessage) {

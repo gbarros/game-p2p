@@ -251,6 +251,12 @@ export class Node {
                         this.parent = null;
                         this.isAttached = false;
                         this.emitState();
+                        // When a live parent connection drops, re-enter attach flow promptly.
+                        // Clear seeds so we preferentially re-auth to host (as an L1).
+                        this.seeds = [];
+                        this.attachAttempts = 0;
+                        this.redirectDepth = 0;
+                        this.scheduleAttachRetry();
                     });
 
                     // Start timers only after successful attachment
@@ -403,6 +409,8 @@ export class Node {
                 this.parent = null;
                 this.isAttached = false;
                 this.emitState();
+                // Parent disconnects should trigger a prompt re-attach attempt (crash handling).
+                this.scheduleAttachRetry();
             });
 
             // Request cousins after successful attach (L2+ only per §7.4)
@@ -1260,6 +1268,7 @@ export class Node {
                     this.reqStateCount = 0;
                     limit = 0; // Send first one immediately
                     this.log(`[Node] Entering PATCH MODE`);
+                    this.emitState();
                 } else {
                     // 12. Rate Limits & Backoff
                     if (this.reqStateCount < 5) {
@@ -1282,6 +1291,7 @@ export class Node {
                 if (this.patchStartTime !== 0 && patchDuration > 60000) {
                     this.log(`[Node] Patch mode persisted > 60s. Escalating to REBINDING`);
                     this.state = NodeState.REBINDING;
+                    this.emitState();
                     this.requestRebind('UPSTREAM_STALL');
                 }
             }
@@ -1420,8 +1430,6 @@ export class Node {
             ack: ack
         };
 
-        this.sendToHost(msg);
-
         if (ack) {
             return new Promise<boolean>((resolve, reject) => {
                 const timeout = setTimeout(() => {
@@ -1430,8 +1438,12 @@ export class Node {
                 }, 10000); // 10s timeout
 
                 this.pendingAcks.set(msgId, { resolve, reject, timeout });
+                // Send AFTER registering the pending ACK to handle synchronous replies (mocks)
+                this.sendToHost(msg);
             });
         }
+
+        this.sendToHost(msg);
     }
 
     private onStateChange: ((state: any) => void) | null = null;

@@ -630,8 +630,6 @@ export class Host {
             ack: ack
         };
 
-        this.routeMessage(peerId, msg);
-
         if (ack) {
             return new Promise<boolean>((resolve, reject) => {
                 const timeout = setTimeout(() => {
@@ -640,8 +638,12 @@ export class Host {
                 }, 10000); // 10s timeout
 
                 this.pendingAcks.set(msgId, { resolve, reject, timeout });
+                // Send AFTER registering the pending ACK to handle synchronous replies (mocks)
+                this.routeMessage(peerId, msg);
             });
         }
+
+        this.routeMessage(peerId, msg);
     }
 
     // UI helper

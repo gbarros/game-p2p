@@ -7,15 +7,27 @@ import {
     AttachAccept,
     AttachReject,
     SubtreeStatus,
-    AckMessage,
-    GameEvent,
-    GameCmd,
     ReqCousins,
     CousinsMessage,
-    RebindAssign,
-    StateMessage,
-    PeerId
+    RebindAssign
 } from './types.js';
+import {
+    DeduplicationCache,
+    RateLimiter,
+    GameEventCache,
+    PendingAckTracker,
+    shuffleArray,
+    createAckMessage,
+    createPongMessage,
+    createStateMessage,
+    createGameEvent,
+    createCousinsMessage,
+    createReqCousinsMessage,
+    createReqStateMessage,
+    createGameCmd,
+    createReqPayloadMessage,
+    addToPath
+} from './utils/index.js';
 
 export enum NodeState {
     NORMAL = 'NORMAL',
@@ -56,7 +68,6 @@ export class Node {
     private _paused: boolean = false;
     private _logger: (msg: string) => void = (msg) => console.log(msg);
     private pendingPings: Map<string, number> = new Map(); // msgId -> timestamp
-    private pendingAcks: Map<string, { resolve: (v: boolean) => void; reject: (e: Error) => void; timeout: NodeJS.Timeout }> = new Map();
 
     // Callback for game events
     private onGameEvent: ((type: string, data: unknown, from: string) => void) | null = null;
@@ -64,8 +75,6 @@ export class Node {
     // Cousin connections for patch mode (S=2 connections at same depth, different parent)
     private cousins: Map<string, DataConnection> = new Map();
     private lastGameSeq: number = 0;
-    private gameEventCache: Array<{ seq: number; event: { type: string; data: unknown } }> = [];
-    private MAX_CACHE_SIZE = 50; // Configurable cache size (increased from 20 for longer sessions)
     private lastParentRainTime: number = Date.now();
     private stallDetectionInterval: NodeJS.Timeout | null = null;
     private lastReqStateTime: number = 0; // Track when we last sent REQ_STATE
@@ -86,15 +95,13 @@ export class Node {
     private descendantToNextHop: Map<string, string> = new Map();
     private descendantsCount: number = 0;
 
-    // Deduplication
-    private recentMsgIds: Set<string> = new Set();
-    private readonly MAX_MSG_ID_CACHE = 100;
+    // Utility classes
+    private dedupCache: DeduplicationCache;
+    private rateLimiter: RateLimiter;
+    private gameEventCache: GameEventCache;
+    private ackTracker: PendingAckTracker;
 
-    // Rate limiting for incoming connections
-    private connectionAttempts: Map<string, number[]> = new Map(); // peerId -> timestamps
-    private readonly CONNECTION_RATE_LIMIT = 5; // Max 5 connections per 10 seconds per peer
-    private readonly CONNECTION_RATE_WINDOW = 10000; // 10 seconds
-    private rateLimitCleanupInterval: NodeJS.Timeout | null = null;
+    private hostId: string | null = null;
 
     constructor(gameId: string, secret: string, peer: Peer, logger?: (msg: string) => void) {
         this.gameId = gameId;
@@ -102,10 +109,16 @@ export class Node {
         this.peer = peer;
         if (logger) this._logger = logger;
 
+        // Initialize utility classes
+        this.dedupCache = new DeduplicationCache(100);
+        this.rateLimiter = new RateLimiter(5, 10000, 30000);
+        this.gameEventCache = new GameEventCache(50);
+        this.ackTracker = new PendingAckTracker(10000);
+
         this.peer.on('open', (id) => {
             this.log(`[Node] Peer Open: ${id}`);
             this.emitState();
-            this.startRateLimitCleanup();
+            this.rateLimiter.startCleanup();
         });
 
         this.peer.on('error', (err) => {
@@ -150,28 +163,19 @@ export class Node {
      * @param size Number of events to cache (default: 50)
      */
     public setGameEventCacheSize(size: number) {
-        if (size < 0) {
+        try {
+            this.gameEventCache.setMaxSize(size);
+            this.log(`[Node] Game event cache size set to ${size}`);
+        } catch (e) {
             this.log('[Node] Warning: Cache size must be >= 0, using default of 50');
-            this.MAX_CACHE_SIZE = 50;
-            return;
         }
-        this.MAX_CACHE_SIZE = size;
-        // Trim existing cache if needed
-        while (this.gameEventCache.length > this.MAX_CACHE_SIZE) {
-            this.gameEventCache.shift();
-        }
-        this.log(`[Node] Game event cache size set to ${size}`);
     }
 
     public close() {
         this.log('[Node] Closing (Simulated Kill)...');
 
         // Clear all pending ACKs and reject promises
-        this.pendingAcks.forEach((pending) => {
-            clearTimeout(pending.timeout);
-            pending.reject(new Error('Node closing'));
-        });
-        this.pendingAcks.clear();
+        this.ackTracker.clear(new Error('Node closing'));
 
         // Clear pending pings
         this.pendingPings.clear();
@@ -180,30 +184,14 @@ export class Node {
         if (this.subtreeInterval) clearInterval(this.subtreeInterval);
         if (this.stallDetectionInterval) clearInterval(this.stallDetectionInterval);
         if (this.attachRetryTimer) clearTimeout(this.attachRetryTimer);
-        if (this.rateLimitCleanupInterval) clearInterval(this.rateLimitCleanupInterval);
+        this.rateLimiter.stopCleanup();
 
         this.subtreeInterval = null;
         this.stallDetectionInterval = null;
         this.attachRetryTimer = null;
-        this.rateLimitCleanupInterval = null;
 
         // Close peer connection
         this.peer.destroy();
-    }
-
-    private startRateLimitCleanup() {
-        // Periodic cleanup of old connection attempt timestamps
-        this.rateLimitCleanupInterval = setInterval(() => {
-            const now = Date.now();
-            this.connectionAttempts.forEach((attempts, peerId) => {
-                const recent = attempts.filter(t => now - t < this.CONNECTION_RATE_WINDOW);
-                if (recent.length === 0) {
-                    this.connectionAttempts.delete(peerId);
-                } else {
-                    this.connectionAttempts.set(peerId, recent);
-                }
-            });
-        }, 30000); // Cleanup every 30s
     }
 
     private log(msg: string, ...args: any[]) {
@@ -213,8 +201,6 @@ export class Node {
     }
 
     // ---------------------------
-
-    private hostId: string | null = null;
 
     // Step A: Bootstrap (Auth)
     public bootstrap(hostId: string) {
@@ -272,7 +258,7 @@ export class Node {
                 this.seeds = msg.seeds || [];
 
                 if (msg.keepAlive) {
-                    // Optimization: Host kept us as a child. 
+                    // Optimization: Host kept us as a child.
                     this.log('[Node] Host kept connection. Attached as L1.');
                     this.parent = conn;
                     this.isAttached = true;
@@ -471,21 +457,12 @@ export class Node {
 
             if (msg.redirect && msg.redirect.length > 0) {
                 // Randomize redirect list to avoid hotspots
-                this.seeds = this.shuffleArray(msg.redirect);
+                this.seeds = shuffleArray(msg.redirect);
             }
 
             // Exponential backoff
             this.scheduleAttachRetry();
         }
-    }
-
-    private shuffleArray<T>(array: T[]): T[] {
-        const shuffled = [...array];
-        for (let i = shuffled.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-        }
-        return shuffled;
     }
 
     private handleMessage(conn: DataConnection, msg: ProtocolMessage) {
@@ -495,23 +472,11 @@ export class Node {
             return;
         }
 
-        // --- Deduplication Layer ---
-        if (this.recentMsgIds.has(msg.msgId)) {
-            // Duplicate message, ignore
+        // Deduplication using utility
+        if (this.dedupCache.isDuplicate(msg.msgId)) {
             return;
         }
-        this.recentMsgIds.add(msg.msgId);
-        if (this.recentMsgIds.size > this.MAX_MSG_ID_CACHE) {
-            // Batch cleanup: remove oldest 20% to prevent unbounded growth
-            const toRemove = Math.floor(this.MAX_MSG_ID_CACHE * 0.2);
-            const iterator = this.recentMsgIds.values();
-            for (let i = 0; i < toRemove; i++) {
-                const item = iterator.next().value;
-                if (item !== undefined) {
-                    this.recentMsgIds.delete(item);
-                }
-            }
-        }
+
         const isFromParent = this.parent && conn.peer === this.parent.peer;
         const isFromChild = this.children.has(conn.peer);
         const isFromCousin = this.cousins.has(conn.peer);
@@ -519,13 +484,7 @@ export class Node {
         // Check if message needs routing (has a dest that's not us)
         if (msg.dest && msg.dest !== this.peer.id) {
             // Message is not for us, route it
-
-            // Add ourselves to trace path
-            const currentPath = msg.path ? [...msg.path] : [];
-            if (!currentPath.includes(this.peer.id)) {
-                currentPath.push(this.peer.id);
-            }
-            const forwardedMsg = { ...msg, path: currentPath };
+            const forwardedMsg = addToPath(msg, this.peer.id);
 
             // Special handling for HOST destination - always route upward
             if (forwardedMsg.dest === 'HOST') {
@@ -596,11 +555,8 @@ export class Node {
                     this.reqStateTarget = null;
                     this.emitState();
 
-                    const currentPath = msg.path ? [...msg.path] : [];
-                    if (!currentPath.includes(this.peer.id)) {
-                        currentPath.push(this.peer.id);
-                    }
-                    this.broadcast({ ...msg, path: currentPath });
+                    const forwardedMsg = addToPath(msg, this.peer.id);
+                    this.broadcast(forwardedMsg);
                 }
                 break;
 
@@ -613,19 +569,7 @@ export class Node {
             case 'PING':
                 // Respond with PONG back to sender using reverse path
                 this.log(`[Node] PING received from ${msg.src}, sending PONG`);
-                // Use reverse of incoming path as explicit route for return
-                const reversePath = [...(msg.path || [])].reverse();
-                const pongMsg: ProtocolMessage = {
-                    t: 'PONG',
-                    v: 1,
-                    gameId: this.gameId,
-                    src: this.peer.id,
-                    msgId: uuidv4(),
-                    replyTo: msg.msgId,
-                    dest: msg.src,
-                    path: [this.peer.id],
-                    route: [this.peer.id, ...reversePath] // Explicit reverse-path routing including self
-                };
+                const pongMsg = createPongMessage(this.gameId, this.peer.id, msg.msgId, msg.src, msg.path);
                 // Route using the reverse path (may go through cousins)
                 this.routeReply(pongMsg, conn);
                 break;
@@ -644,11 +588,8 @@ export class Node {
 
             case 'ACK':
                 // Resolve pending ACK promise if exists
-                if (msg.replyTo && this.pendingAcks.has(msg.replyTo)) {
-                    const pending = this.pendingAcks.get(msg.replyTo)!;
-                    clearTimeout(pending.timeout);
-                    pending.resolve(true);
-                    this.pendingAcks.delete(msg.replyTo);
+                if (msg.replyTo) {
+                    this.ackTracker.resolve(msg.replyTo);
                     this.log(`[Node] ACK received for msg ${msg.replyTo}`);
                 }
                 break;
@@ -664,26 +605,12 @@ export class Node {
 
                 // Cache the event
                 if (msg.event) {
-                    this.gameEventCache.push({ seq: msg.gameSeq || 0, event: msg.event });
-                    if (this.gameEventCache.length > this.MAX_CACHE_SIZE) {
-                        this.gameEventCache.shift();
-                    }
+                    this.gameEventCache.add(msg.gameSeq || 0, msg.event);
                 }
 
                 // Send ACK if requested - strictly use reverse of incoming path
                 if (msg.ack) {
-                    const reversePath = msg.path ? [...msg.path].reverse() : [msg.src];
-                    const ackMsg: AckMessage = {
-                        t: 'ACK',
-                        v: 1,
-                        gameId: this.gameId,
-                        src: this.peer.id,
-                        msgId: uuidv4(),
-                        replyTo: msg.msgId,
-                        dest: msg.src,
-                        path: [this.peer.id],
-                        route: [this.peer.id, ...reversePath]
-                    };
+                    const ackMsg = createAckMessage(this.gameId, this.peer.id, msg.msgId, msg.src, msg.path);
                     // Route using the reverse path
                     this.routeReply(ackMsg, conn);
                 }
@@ -694,22 +621,16 @@ export class Node {
 
                 // Broadcast to children if from parent (tree propagation)
                 if (isFromParent) {
-                    const currentPath = msg.path ? [...msg.path] : [];
-                    if (!currentPath.includes(this.peer.id)) {
-                        currentPath.push(this.peer.id);
-                    }
-                    this.broadcast({ ...msg, path: currentPath });
+                    const forwardedMsg = addToPath(msg, this.peer.id);
+                    this.broadcast(forwardedMsg);
                 }
                 break;
 
             case 'PAYLOAD':
-                this.log(`[Node] PAYLOAD received from ${msg.src} (type: ${msg.payloadType}). ReplyTo: ${msg.replyTo}. Pending: ${Array.from(this.pendingAcks.keys()).join(',')}`);
+                this.log(`[Node] PAYLOAD received from ${msg.src} (type: ${msg.payloadType}). ReplyTo: ${msg.replyTo}. Pending: ${Array.from(this.ackTracker['pendingAcks'].keys()).join(',')}`);
                 // Trigger any waiting promises for this payload (using replyTo as key)
-                if (msg.replyTo && this.pendingAcks.has(msg.replyTo)) {
-                    const pending = this.pendingAcks.get(msg.replyTo)!;
-                    clearTimeout(pending.timeout);
-                    pending.resolve(true);
-                    this.pendingAcks.delete(msg.replyTo);
+                if (msg.replyTo) {
+                    this.ackTracker.resolve(msg.replyTo);
                 }
                 break;
 
@@ -717,31 +638,22 @@ export class Node {
                 // Handle state request from cousin or child
                 this.log(`[Node] REQ_STATE from ${msg.src} (fromGameSeq: ${msg.fromGameSeq})`);
 
-                const eventsToSend = this.gameEventCache
-                    .filter(e => e.seq > msg.fromGameSeq)
-                    .map(e => ({ seq: e.seq, event: e.event }));
+                const eventsToSend = this.gameEventCache.getEventsAfter(msg.fromGameSeq);
+                const minSeqInCache = this.gameEventCache.getMinSeq();
+                const truncated = this.gameEventCache.isTruncated(msg.fromGameSeq);
 
-                // Check for truncation
-                const minSeqInCache = this.gameEventCache.length > 0 ? this.gameEventCache[0].seq : 0;
-                const truncated = minSeqInCache > (msg.fromGameSeq + 1);
-
-                const reversePathForState = [...(msg.path || [])].reverse();
-                const stateMsg: StateMessage = {
-                    t: 'STATE',
-                    v: 1,
-                    gameId: this.gameId,
-                    src: this.peer.id,
-                    msgId: uuidv4(),
-                    replyTo: msg.msgId,
-                    dest: msg.src,
-                    latestRainSeq: this.rainSeq,
-                    latestGameSeq: this.lastGameSeq,
-                    events: eventsToSend,
-                    minGameSeqAvailable: minSeqInCache,
-                    truncated: truncated,
-                    path: [this.peer.id],
-                    route: [this.peer.id, ...reversePathForState] // Explicit reverse-path routing including self
-                };
+                const stateMsg = createStateMessage(
+                    this.gameId,
+                    this.peer.id,
+                    msg.msgId,
+                    msg.src,
+                    this.rainSeq,
+                    this.lastGameSeq,
+                    eventsToSend,
+                    minSeqInCache,
+                    truncated,
+                    msg.path
+                );
 
                 // Route using the reverse path
                 this.routeReply(stateMsg, conn);
@@ -762,16 +674,11 @@ export class Node {
 
                         // Ignore events we've already seen
                         if (eventSeq <= this.lastGameSeq) {
-                            // this.log(`[Node] Skipping duplicate event seq ${eventSeq}`);
                             return;
                         }
 
                         // Add to cache
-                        this.gameEventCache.push({ seq: eventSeq, event });
-                        if (this.gameEventCache.length > this.MAX_CACHE_SIZE) {
-                            this.gameEventCache.shift();
-                        }
-
+                        this.gameEventCache.add(eventSeq, event);
                         newEvents.push({ seq: eventSeq, event });
 
                         // Notify callback
@@ -785,16 +692,7 @@ export class Node {
 
                     // Forward only new repaired events downstream
                     newEvents.forEach(({ seq, event }) => {
-                        const gameEvent: GameEvent = {
-                            t: 'GAME_EVENT',
-                            v: 1,
-                            gameId: this.gameId,
-                            src: this.peer.id,
-                            msgId: uuidv4(),
-                            gameSeq: seq,
-                            event: event,
-                            path: [this.peer.id]
-                        };
+                        const gameEvent = createGameEvent(this.gameId, this.peer.id, seq, event.type, event.data);
                         this.broadcast(gameEvent);
                     });
                 }
@@ -873,24 +771,19 @@ export class Node {
                     });
 
                     // Shuffle and limit to desired count
-                    const shuffled = this.shuffleArray(selected);
+                    const shuffled = shuffleArray(selected);
                     const finalCandidates = shuffled.slice(0, msg.desiredCount);
 
                     this.log(`[Node] Found ${finalCandidates.length} local cousin candidates for ${msg.src}`);
 
-                    const reversePath = [...(msg.path || [])].reverse();
-                    const cousinsMsg: CousinsMessage = {
-                        t: 'COUSINS',
-                        v: 1,
-                        gameId: this.gameId,
-                        src: this.peer.id,
-                        msgId: uuidv4(),
-                        replyTo: msg.msgId,
-                        dest: msg.src,
-                        candidates: finalCandidates,
-                        path: [this.peer.id],
-                        route: [this.peer.id, ...reversePath] // Include reverse-path routing
-                    };
+                    const cousinsMsg = createCousinsMessage(
+                        this.gameId,
+                        this.peer.id,
+                        msg.msgId,
+                        msg.src,
+                        finalCandidates,
+                        msg.path
+                    );
 
                     // Route back to requester using reverse path
                     this.routeReply(cousinsMsg, conn);
@@ -901,19 +794,14 @@ export class Node {
                         this.parent.send(msg);
                     } else {
                         // Send empty response
-                        const reversePath = [...(msg.path || [])].reverse();
-                        const cousinsMsg: CousinsMessage = {
-                            t: 'COUSINS',
-                            v: 1,
-                            gameId: this.gameId,
-                            src: this.peer.id,
-                            msgId: uuidv4(),
-                            replyTo: msg.msgId,
-                            dest: msg.src,
-                            candidates: [],
-                            path: [this.peer.id],
-                            route: [this.peer.id, ...reversePath] // Include reverse-path routing
-                        };
+                        const cousinsMsg = createCousinsMessage(
+                            this.gameId,
+                            this.peer.id,
+                            msg.msgId,
+                            msg.src,
+                            [],
+                            msg.path
+                        );
                         this.routeReply(cousinsMsg, conn);
                     }
                 }
@@ -1005,20 +893,13 @@ export class Node {
     // --- Parent Logic ---
 
     private handleIncomingConnection(conn: DataConnection) {
-        // Rate limit check
-        const now = Date.now();
-        const attempts = this.connectionAttempts.get(conn.peer) || [];
-        const recentAttempts = attempts.filter(t => now - t < this.CONNECTION_RATE_WINDOW);
-
-        if (recentAttempts.length >= this.CONNECTION_RATE_LIMIT) {
-            this.log(`[Node] Rate limit exceeded for ${conn.peer} (${recentAttempts.length} attempts in ${this.CONNECTION_RATE_WINDOW}ms), rejecting`);
+        // Rate limit check using utility
+        if (!this.rateLimiter.allowConnection(conn.peer)) {
+            const count = this.rateLimiter.getAttemptCount(conn.peer);
+            this.log(`[Node] Rate limit exceeded for ${conn.peer} (${count} attempts), rejecting`);
             conn.close();
             return;
         }
-
-        // Track this attempt
-        recentAttempts.push(now);
-        this.connectionAttempts.set(conn.peer, recentAttempts);
 
         const meta = conn.metadata;
         if (!meta || meta.gameId !== this.gameId || meta.secret !== this.secret) {
@@ -1062,8 +943,6 @@ export class Node {
         });
     }
 
-
-
     private handleIncomingAttach(conn: DataConnection, msg: AttachRequest) {
         if (this.children.size >= this.MAX_CHILDREN) {
             // Smart redirect: find descendants with free slots
@@ -1084,7 +963,7 @@ export class Node {
             });
 
             // Shuffle and limit to 10
-            const shuffled = this.shuffleArray(candidates);
+            const shuffled = shuffleArray(candidates);
             const redirectList = shuffled.slice(0, 10);
 
             const reject: AttachReject = {
@@ -1142,22 +1021,6 @@ export class Node {
         this.children.forEach(c => {
             if (c.open) c.send(msg);
         });
-    }
-
-    private routeMessageToTarget(targetId: string, msg: ProtocolMessage) {
-        // Helper to route a message to a specific target (used for routing COUSINS replies, etc.)
-        const nextHop = this.descendantToNextHop.get(targetId);
-        if (nextHop && this.children.has(nextHop)) {
-            const conn = this.children.get(nextHop);
-            if (conn && conn.open) {
-                conn.send(msg);
-                return;
-            }
-        }
-        // Fallback: send to parent
-        if (this.parent && this.parent.open) {
-            this.parent.send(msg);
-        }
     }
 
     private routeReply(msg: ProtocolMessage, sourceConn: DataConnection) {
@@ -1247,17 +1110,7 @@ export class Node {
 
         this.log(`[Node] Requesting cousins (depth=${this.myDepth})`);
 
-        const reqCousins: ReqCousins = {
-            t: 'REQ_COUSINS',
-            v: 1,
-            gameId: this.gameId,
-            src: this.peer.id,
-            msgId: uuidv4(),
-            requesterDepth: this.myDepth,
-            desiredCount: 2,
-            path: [this.peer.id]
-        };
-
+        const reqCousins = createReqCousinsMessage(this.gameId, this.peer.id, this.myDepth, 2);
         this.parent.send(reqCousins);
     }
 
@@ -1356,33 +1209,15 @@ export class Node {
                     this.requestRebind('UPSTREAM_STALL');
                 }
             }
-
-
         }, 1000);
     }
 
     public requestPayload(type: string): Promise<boolean> {
-        const msgId = uuidv4();
-        const msg: ProtocolMessage = {
-            t: 'REQ_PAYLOAD',
-            v: 1,
-            gameId: this.gameId,
-            src: this.peer.id,
-            msgId,
-            dest: 'HOST',
-            payloadType: type,
-            path: [this.peer.id]
-        };
-        return new Promise<boolean>((resolve, reject) => {
-            const timeout = setTimeout(() => {
-                this.pendingAcks.delete(msgId);
-                reject(new Error(`Payload timeout for ${type}`));
-            }, 10000);
-            this.pendingAcks.set(msgId, { resolve, reject, timeout });
-
-            // Send AFTER registering the pending ACK to handle synchronous replies (mocks)
-            this.sendToHost(msg);
-        });
+        const msg = createReqPayloadMessage(this.gameId, this.peer.id, type);
+        const promise = this.ackTracker.waitForAck(msg.msgId);
+        // Send AFTER registering the pending ACK to handle synchronous replies (mocks)
+        this.sendToHost(msg);
+        return promise;
     }
 
     private sendReqStateToCousins() {
@@ -1394,17 +1229,13 @@ export class Node {
 
             if (cousinConn && cousinConn.open) {
                 this.log(`[Node] Requesting state from cousin ${targetId}`);
-                const reqState: ProtocolMessage = {
-                    t: 'REQ_STATE',
-                    v: 1,
-                    gameId: this.gameId,
-                    src: this.peer.id,
-                    msgId: uuidv4(),
-                    dest: targetId,
-                    fromRainSeq: this.rainSeq,
-                    fromGameSeq: this.lastGameSeq,
-                    path: [this.peer.id]
-                };
+                const reqState = createReqStateMessage(
+                    this.gameId,
+                    this.peer.id,
+                    targetId,
+                    this.rainSeq,
+                    this.lastGameSeq
+                );
                 cousinConn.send(reqState);
                 this.lastReqStateTime = Date.now();
                 this.reqStateTarget = 'COUSIN';
@@ -1414,17 +1245,13 @@ export class Node {
             // No cousins, request from host as fallback or request cousins
             if (Date.now() - this.lastReqStateTime > 5000) {
                 this.log(`[Node] No cousins available, fallback state request to host`);
-                const reqStateHost: ProtocolMessage = {
-                    t: 'REQ_STATE',
-                    v: 1,
-                    gameId: this.gameId,
-                    src: this.peer.id,
-                    msgId: uuidv4(),
-                    dest: 'HOST',
-                    fromRainSeq: this.rainSeq,
-                    fromGameSeq: this.lastGameSeq,
-                    path: [this.peer.id]
-                };
+                const reqStateHost = createReqStateMessage(
+                    this.gameId,
+                    this.peer.id,
+                    'HOST',
+                    this.rainSeq,
+                    this.lastGameSeq
+                );
                 this.sendToHost(reqStateHost);
                 this.lastReqStateTime = Date.now();
                 this.reqStateTarget = 'HOST';
@@ -1478,30 +1305,13 @@ export class Node {
      * @param ack If true, returns Promise that resolves when ACK received
      */
     public sendGameEvent(type: string, data: unknown, ack: boolean = false): void | Promise<boolean> {
-        const msgId = uuidv4();
-        const msg: GameCmd = {
-            t: 'GAME_CMD',
-            v: 1,
-            gameId: this.gameId,
-            src: this.peer.id,
-            msgId,
-            cmd: { type, data },
-            dest: 'HOST',
-            path: [this.peer.id],
-            ack: ack
-        };
+        const msg = createGameCmd(this.gameId, this.peer.id, type, data, ack);
 
         if (ack) {
-            return new Promise<boolean>((resolve, reject) => {
-                const timeout = setTimeout(() => {
-                    this.pendingAcks.delete(msgId);
-                    reject(new Error(`ACK timeout for message ${msgId}`));
-                }, 10000); // 10s timeout
-
-                this.pendingAcks.set(msgId, { resolve, reject, timeout });
-                // Send AFTER registering the pending ACK to handle synchronous replies (mocks)
-                this.sendToHost(msg);
-            });
+            const promise = this.ackTracker.waitForAck(msg.msgId);
+            // Send AFTER registering the pending ACK to handle synchronous replies (mocks)
+            this.sendToHost(msg);
+            return promise;
         }
 
         this.sendToHost(msg);

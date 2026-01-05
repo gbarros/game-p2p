@@ -1427,11 +1427,9 @@ describe('Phase 4: Advanced Reliability Tests', () => {
         const nodeA = new Node('game', 'secret', new FakePeer('nodeA') as any);
         const nodeB = new Node('game', 'secret', new FakePeer('nodeB') as any);
 
-        // Add some events to nodeB's cache
-        (nodeB as any).gameEventCache = [
-            { seq: 1, event: { type: 'EVT1', data: { a: 1 } } },
-            { seq: 2, event: { type: 'EVT2', data: { a: 2 } } }
-        ];
+        // Add some events to nodeB's cache using the proper API
+        (nodeB as any).gameEventCache.add(1, { type: 'EVT1', data: { a: 1 } });
+        (nodeB as any).gameEventCache.add(2, { type: 'EVT2', data: { a: 2 } });
         (nodeB as any).lastGameSeq = 2;
         (nodeB as any).rainSeq = 10;
 
@@ -1483,7 +1481,7 @@ describe('Phase 4: Advanced Reliability Tests', () => {
         await settleTimers(5);
 
         // Verify host cache is truncated
-        expect((host as any).gameEventCache.length).toBeLessThanOrEqual(100);
+        expect((host as any).gameEventCache.size()).toBeLessThanOrEqual(100);
 
         // Request state from seq 0 (which is now truncated)
         const hostConn = new FakeDataConnection('node');
@@ -1560,7 +1558,7 @@ describe('Phase 4: Advanced Reliability Tests', () => {
         await settleTimers(5);
 
         // Verify size never exceeds MAX_MSG_ID_CACHE (100)
-        expect((node as any).recentMsgIds.size).toBeLessThanOrEqual(100);
+        expect((node as any).dedupCache.size()).toBeLessThanOrEqual(100);
     });
 
     it('Test F: multiple nodes rebinding simultaneously spread requests with jitter', async () => {

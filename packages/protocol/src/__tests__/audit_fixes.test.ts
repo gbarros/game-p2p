@@ -134,10 +134,8 @@ describe('Audit Fixes Verification', () => {
         const node = new Node('game', 'secret', new FakePeer('node') as any);
         (node as any).rainSeq = 10;
         (node as any).lastGameSeq = 2;
-        (node as any).gameEventCache = [
-            { seq: 1, event: { type: 'EVT1', data: { a: 1 } } },
-            { seq: 2, event: { type: 'EVT2', data: { a: 2 } } },
-        ];
+        (node as any).gameEventCache.add(1, { type: 'EVT1', data: { a: 1 } });
+        (node as any).gameEventCache.add(2, { type: 'EVT2', data: { a: 2 } });
 
         const cousinConn = new FakeDataConnection('cousin');
         cousinConn.open = true;

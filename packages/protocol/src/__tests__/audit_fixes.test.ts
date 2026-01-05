@@ -29,8 +29,8 @@ describe('Audit Fixes Verification', () => {
         // Simulate nodeA attached to host
         // We can manually simulate the request without full attachment
         const connToHost = new FakeDataConnection(hostId);
-        (node as any).parent = connToHost;
-        (node as any).isAttached = true;
+        (node as any).connManager.parent = connToHost;
+        (node as any).stateManager.isAttached = true;
         // connToHost.peer = hostId; // This is readonly/set by constructor, need cast if modifying or pass in constructor
         // FakeDataConnection constructor sets this.peer
         // But constructor takes 'peer' as destination? No, 'peer' property of connection usually means REMOTE peer.
@@ -44,7 +44,7 @@ describe('Audit Fixes Verification', () => {
         // hostConn.peer = 'nodeA'; // set by constructor
         hostConn.open = true;
         (host as any).children.set('nodeA', hostConn);
-        (host as any).topology.set('nodeA', { nextHop: 'nodeA', depth: 1, lastSeen: Date.now(), freeSlots: 3, state: 'OK' });
+        (host as any).topologyManager.topology.set('nodeA', { nextHop: 'nodeA', depth: 1, lastSeen: Date.now(), freeSlots: 3, state: 'OK' });
 
         // Node sends REQ_STATE
         const reqState: ProtocolMessage = {
@@ -81,7 +81,7 @@ describe('Audit Fixes Verification', () => {
         const hostConn = new FakeDataConnection('nodeA');
         hostConn.open = true;
         (host as any).children.set('nodeA', hostConn);
-        (host as any).topology.set('nodeA', { nextHop: 'nodeA', depth: 1, lastSeen: Date.now(), freeSlots: 3, state: 'OK' });
+        (host as any).topologyManager.topology.set('nodeA', { nextHop: 'nodeA', depth: 1, lastSeen: Date.now(), freeSlots: 3, state: 'OK' });
 
         // Host MAX_CACHE_SIZE is 100. Push 110 events so the oldest 10 drop.
         for (let i = 1; i <= 110; i++) {
@@ -123,16 +123,16 @@ describe('Audit Fixes Verification', () => {
         // Access private method via any
         (nodeB as any).handleIncomingConnection(connFromA);
 
-        expect((nodeB as any).cousins.has('nodeA')).toBe(true);
-        expect((nodeB as any).cousins.get('nodeA')).toBe(connFromA);
+        expect((nodeB as any).connManager.cousins.has('nodeA')).toBe(true);
+        expect((nodeB as any).connManager.cousins.get('nodeA')).toBe(connFromA);
 
         // A cousin connection must NOT be treated as a child connection
-        expect((nodeB as any).children.has('nodeA')).toBe(false);
+        expect((nodeB as any).connManager.children.has('nodeA')).toBe(false);
     });
 
     it('Gap 3a: Node responds to REQ_STATE with sequenced events (StateMessage.events carries {seq,event})', async () => {
         const node = new Node('game', 'secret', new FakePeer('node') as any);
-        (node as any).rainSeq = 10;
+        (node as any).stateManager.rainSeq = 10;
         (node as any).lastGameSeq = 2;
         (node as any).gameEventCache.add(1, { type: 'EVT1', data: { a: 1 } });
         (node as any).gameEventCache.add(2, { type: 'EVT2', data: { a: 2 } });
@@ -169,11 +169,11 @@ describe('Audit Fixes Verification', () => {
         const node = new Node('game', 'secret', new FakePeer('node') as any);
         const childConn = new FakeDataConnection('child');
         childConn.open = true;
-        (node as any).children.set('child', childConn);
+        (node as any).connManager.children.set('child', childConn);
 
         // Pretend we are already up to seq 96.
         (node as any).lastGameSeq = 96;
-        (node as any).rainSeq = 10;
+        (node as any).stateManager.rainSeq = 10;
 
         const parentConn = new FakeDataConnection('parent');
         parentConn.open = true;
@@ -249,7 +249,7 @@ describe('Audit Fixes Verification', () => {
 
             // Set topology: only child3 has free slots
             const freeSlots = i === 3 ? 5 : 0;
-            (host as any).topology.set(id, { nextHop: id, depth: 1, lastSeen: Date.now(), freeSlots: freeSlots, state: 'OK' });
+            (host as any).topologyManager.topology.set(id, { nextHop: id, depth: 1, lastSeen: Date.now(), freeSlots: freeSlots, state: 'OK' });
         }
 
         const newConn = new FakeDataConnection('newJoiner');
@@ -297,14 +297,14 @@ describe('Audit Fixes Verification', () => {
         // A has child B
         const connB = new FakeDataConnection('nodeB');
         // (connB as any).peer = 'nodeB';
-        (nodeA as any).children.set('nodeB', connB);
+        (nodeA as any).connManager.children.set('nodeB', connB);
         (nodeA as any).childDescendants.set('nodeB', [{ id: 'nodeC', hops: 2 }]); // B has child C
 
         // Mock parent for A
         const parentConn = new FakeDataConnection('host');
         // (parentConn as any).peer = 'host';
         parentConn.open = true;
-        (nodeA as any).parent = parentConn;
+        (nodeA as any).connManager.parent = parentConn;
 
         // Trigger rebind
         (nodeA as any).requestRebind('TEST');
@@ -322,12 +322,12 @@ describe('Audit Fixes Verification', () => {
 
         const connB = new FakeDataConnection('nodeB');
         connB.open = true;
-        (nodeA as any).children.set('nodeB', connB);
+        (nodeA as any).connManager.children.set('nodeB', connB);
         (nodeA as any).childDescendants.set('nodeB', [{ id: 'nodeC', hops: 1, freeSlots: 0 }]);
 
         const parentConn = new FakeDataConnection('host');
         parentConn.open = true;
-        (nodeA as any).parent = parentConn;
+        (nodeA as any).connManager.parent = parentConn;
 
         (nodeA as any).reportSubtree();
 
@@ -340,11 +340,11 @@ describe('Audit Fixes Verification', () => {
         const node = new Node('game', 'secret', new FakePeer('node') as any);
         const childConn = new FakeDataConnection('child');
         childConn.open = true;
-        (node as any).children.set('child', childConn);
+        (node as any).connManager.children.set('child', childConn);
 
         // State: PATCHING, rainSeq: 10
-        (node as any).state = 'PATCHING';
-        (node as any).rainSeq = 10;
+        (node as any).stateManager.state = 'PATCHING';
+        (node as any).stateManager.rainSeq = 10;
 
         // Receive STATE with rainSeq 11
         const stateMsg: ProtocolMessage = {
@@ -368,7 +368,7 @@ describe('Audit Fixes Verification', () => {
         expect(rain.rainSeq).toBe(11);
 
         // Node must also update its local pointer.
-        expect((node as any).rainSeq).toBe(11);
+        expect((node as any).stateManager.rainSeq).toBe(11);
     });
 
     it('Gap 6: Host dedupes messages (prevents double ACK / double apply)', async () => {
@@ -376,7 +376,7 @@ describe('Audit Fixes Verification', () => {
         const conn = new FakeDataConnection('node');
         conn.open = true;
         (host as any).children.set('node', conn);
-        (host as any).topology.set('node', { nextHop: 'node', depth: 1, lastSeen: Date.now(), freeSlots: 3, state: 'OK' });
+        (host as any).topologyManager.topology.set('node', { nextHop: 'node', depth: 1, lastSeen: Date.now(), freeSlots: 3, state: 'OK' });
 
         const msg: ProtocolMessage = {
             t: 'GAME_CMD',

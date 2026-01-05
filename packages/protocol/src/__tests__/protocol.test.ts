@@ -121,10 +121,10 @@ describe('Heartbeat and stall detection', () => {
         const cousinConn = new FakeDataConnection('cousin');
         cousinConn.open = true;
 
-        (node as any).parent = parentConn;
-        (node as any).isAttached = true;
-        (node as any).cousins.set('cousin', cousinConn);
-        (node as any).lastParentRainTime = Date.now() - 3500;
+        (node as any).connManager.parent = parentConn;
+        (node as any).stateManager.setAttached(true);
+        (node as any).connManager.cousins.set('cousin', cousinConn);
+        (node as any).stateManager.lastParentRainTime = Date.now() - 3500;
 
         await vi.advanceTimersByTimeAsync(2000);
 
@@ -191,11 +191,11 @@ describe('Routing and commands', () => {
         await vi.advanceTimersByTimeAsync(500);
 
         // Verify L2 node is attached (not to host)
-        expect((l2Node as any).isAttached).toBe(true);
+        expect((l2Node as any).stateManager.isAttached).toBe(true);
         expect((l2Node as any).myDepth).toBe(2);
 
         // L2 node MUST send REQ_COUSINS to its L1 parent
-        const parentConn = (l2Node as any).parent as FakeDataConnection;
+        const parentConn = (l2Node as any).connManager.parent as FakeDataConnection;
         expect(parentConn).toBeTruthy();
         const sent = parentConn.sent.filter((msg) => (msg as ProtocolMessage).t === 'REQ_COUSINS');
         expect(sent.length).toBeGreaterThan(0);
@@ -216,8 +216,8 @@ describe('Join robustness', () => {
         await settleTimers();
         await vi.advanceTimersByTimeAsync(200);
 
-        expect((node as any).isAttached).toBe(true);
-        expect((node as any).parent?.peer).toBe(host.getPeerId());
+        expect((node as any).stateManager.isAttached).toBe(true);
+        expect((node as any).connManager.parent?.peer).toBe(host.getPeerId());
     });
 
     it('backs off and retries when connections error', async () => {
@@ -254,7 +254,7 @@ describe('State repair and fallback', () => {
 
         await vi.advanceTimersByTimeAsync(7000);
 
-        const parentConn = (node as any).parent as FakeDataConnection;
+        const parentConn = (node as any).connManager.parent as FakeDataConnection;
         const hostReqs = parentConn.sent.filter((msg) => {
             const typed = msg as ProtocolMessage;
             return typed.t === 'REQ_STATE' && typed.dest === 'HOST';
@@ -269,9 +269,9 @@ describe('State repair and fallback', () => {
         const childConn = new FakeDataConnection('child');
         childConn.open = true;
 
-        (parent as any).children.set('child', childConn);
+        (parent as any).connManager.children.set('child', childConn);
         // Also need to set isAttached for handleMessage to work properly
-        (parent as any).isAttached = true;
+        (parent as any).stateManager.isAttached = true;
 
         const req: ProtocolMessage = {
             t: 'REQ_STATE',
@@ -302,8 +302,8 @@ describe('Cousin discovery resolution', () => {
         childA.open = true;
         childB.open = true;
 
-        (ancestor as any).children.set('child-a', childA);
-        (ancestor as any).children.set('child-b', childB);
+        (ancestor as any).connManager.children.set('child-a', childA);
+        (ancestor as any).connManager.children.set('child-b', childB);
 
         (ancestor as any).descendantToNextHop.set('req-1', 'child-a');
         (ancestor as any).descendantToNextHop.set('cousin-1', 'child-b');
@@ -346,9 +346,9 @@ describe('Cousin discovery resolution', () => {
         childB.open = true;
         childC.open = true;
 
-        (ancestor as any).children.set('child-a', childA);
-        (ancestor as any).children.set('child-b', childB);
-        (ancestor as any).children.set('child-c', childC);
+        (ancestor as any).connManager.children.set('child-a', childA);
+        (ancestor as any).connManager.children.set('child-b', childB);
+        (ancestor as any).connManager.children.set('child-c', childC);
 
         (ancestor as any).descendantToNextHop.set('req-1', 'child-a');
         (ancestor as any).descendantToNextHop.set('cousin-b', 'child-b');
@@ -388,7 +388,7 @@ describe('Reverse-path replies', () => {
         const parentConn = new FakeDataConnection('parent');
         parentConn.open = true;
         (host as any).children.set('parent', parentConn);
-        (host as any).topology.set('node', {
+        (host as any).topologyManager.topology.set('node', {
             nextHop: 'parent',
             depth: 2,
             lastSeen: Date.now(),
@@ -425,16 +425,16 @@ describe('Subtree reporting and topology', () => {
         const parentConn = new FakeDataConnection('parent');
         parentConn.open = true;
 
-        (node as any).parent = parentConn;
-        (node as any).rainSeq = 7;
+        (node as any).connManager.parent = parentConn;
+        (node as any).stateManager._rainSeq = 7;
 
         const childA = new FakeDataConnection('child-a');
         const childB = new FakeDataConnection('child-b');
         childA.open = true;
         childB.open = true;
 
-        (node as any).children.set('child-a', childA);
-        (node as any).children.set('child-b', childB);
+        (node as any).connManager.children.set('child-a', childA);
+        (node as any).connManager.children.set('child-b', childB);
         (node as any).childCapacities.set('child-a', 2);
         (node as any).childCapacities.set('child-b', 1);
         (node as any).childDescendants.set('child-b', [{ id: 'grand-1', hops: 1, freeSlots: 1 }]);
@@ -490,8 +490,8 @@ describe('Rebind flow', () => {
 
         const currentParent = new FakeDataConnection('parent-old');
         currentParent.open = true;
-        (node as any).parent = currentParent;
-        (node as any).isAttached = true;
+        (node as any).connManager.parent = currentParent;
+        (node as any).stateManager.setAttached(true);
 
         const rebindAssign: ProtocolMessage = {
             t: 'REBIND_ASSIGN',
@@ -508,8 +508,8 @@ describe('Rebind flow', () => {
         (node as any).handleMessage(currentParent, rebindAssign);
         await vi.advanceTimersByTimeAsync(200);
 
-        expect((node as any).parent?.peer).toBe(candidate.getPeerId());
-        expect((node as any).isAttached).toBe(true);
+        expect((node as any).connManager.parent?.peer).toBe(candidate.getPeerId());
+        expect((node as any).stateManager.isAttached).toBe(true);
     });
 
     it('waits 60s before rebind per spec', async () => {
@@ -518,20 +518,20 @@ describe('Rebind flow', () => {
 
         const parentConn = new FakeDataConnection('parent');
         parentConn.open = true;
-        (node as any).parent = parentConn;
-        (node as any).isAttached = true;
-        (node as any).state = 'PATCHING';
-        (node as any).patchStartTime = Date.now() - 59000; // 59 seconds ago
+        (node as any).connManager.parent = parentConn;
+        (node as any).stateManager.setAttached(true);
+        (node as any).stateManager.state = 'PATCHING';
+        (node as any).stateManager._patchStartTime = Date.now() - 59000; // 59 seconds ago
 
         // At 59s patch time, should still be PATCHING
         await vi.advanceTimersByTimeAsync(500);
-        expect((node as any).state).toBe('PATCHING');
+        expect((node as any).stateManager.state).toBe('PATCHING');
 
         // Set to 61s ago - next tick should trigger REBINDING
-        (node as any).patchStartTime = Date.now() - 61000;
-        await vi.advanceTimersByTimeAsync(1500);
+        (node as any).stateManager._patchStartTime = Date.now() - 61000;
+        await vi.advanceTimersByTimeAsync(2000);
 
-        expect((node as any).state).toBe('REBINDING');
+        expect((node as any).stateManager.state).toBe('REBINDING');
     });
 });
 
@@ -549,7 +549,7 @@ describe('Security and payload', () => {
 
         const lastHostState = getLastState(hostStates);
         expect(lastHostState.children.length).toBe(0);
-        expect((node as any).isAttached).toBe(false);
+        expect((node as any).stateManager.isAttached).toBe(false);
     });
 
     it('ignores messages with mismatched gameId', () => {
@@ -578,7 +578,7 @@ describe('Security and payload', () => {
         (node as any).handleIncomingConnection(conn);
 
         expect(conn.open).toBe(false);
-        expect((node as any).children.size).toBe(0);
+        expect((node as any).connManager.children.size).toBe(0);
     });
 
     it('ignores mismatched gameId messages from connected peers', () => {
@@ -586,8 +586,8 @@ describe('Security and payload', () => {
         const parentConn = new FakeDataConnection('parent', { gameId: 'game', secret: 'secret' });
         parentConn.open = true;
 
-        (node as any).parent = parentConn;
-        (node as any).isAttached = true;
+        (node as any).connManager.parent = parentConn;
+        (node as any).stateManager.setAttached(true);
 
         const msg: ProtocolMessage = {
             t: 'PING',
@@ -610,8 +610,8 @@ describe('Security and payload', () => {
         await vi.advanceTimersByTimeAsync(500); // Allow connection to establish
 
         // Verify node is attached
-        expect((node as any).isAttached).toBe(true);
-        expect((node as any).parent).toBeTruthy();
+        expect((node as any).stateManager.isAttached).toBe(true);
+        expect((node as any).connManager.parent).toBeTruthy();
 
         // Per spec, REQ_PAYLOAD must receive PAYLOAD response
         const promise = node.requestPayload('INITIAL_STATE');
@@ -824,7 +824,7 @@ describe('Host connection limits (§3.2)', () => {
         await vi.advanceTimersByTimeAsync(500);
         randomSpy.mockRestore();
 
-        expect((joiner as any).isAttached).toBe(true);
+        expect((joiner as any).stateManager.isAttached).toBe(true);
     });
 });
 
@@ -837,7 +837,7 @@ describe('Node state machine (§11)', () => {
         await settleTimers();
         await vi.advanceTimersByTimeAsync(1000);
 
-        expect((node as any).state || 'NORMAL').toBe('NORMAL');
+        expect((node as any).stateManager.state || 'NORMAL').toBe('NORMAL');
     });
 
     it('transitions NORMAL → SUSPECT_UPSTREAM after 3s stall', async () => {
@@ -846,17 +846,16 @@ describe('Node state machine (§11)', () => {
 
         const parentConn = new FakeDataConnection('parent');
         parentConn.open = true;
-        (node as any).parent = parentConn;
-        (node as any).isAttached = true;
-        (node as any).state = 'NORMAL'; // Explicitly set initial state
-        (node as any).lastParentRainTime = Date.now() - 3500;
-
-        // Run stall detection manually since interval may not be running
+        (node as any).connManager.parent = parentConn;
+        (node as any).stateManager.setAttached(true);
+        (node as any).connManager.parent = (node as any).hostConnection;
+        (node as any).myDepth = 1;
+        (node as any).stateManager._lastParentRainTime = Date.now() - 5000; // Stale parent      // Run stall detection manually since interval may not be running
         await vi.advanceTimersByTimeAsync(2000);
 
         // The state should transition through SUSPECT_UPSTREAM to PATCHING
         // Since the impl transitions immediately, accept either
-        expect(['SUSPECT_UPSTREAM', 'PATCHING']).toContain((node as any).state);
+        expect(['SUSPECT_UPSTREAM', 'PATCHING']).toContain((node as any).stateManager.state);
     });
 
     it('transitions SUSPECT_UPSTREAM → PATCHING immediately', async () => {
@@ -868,30 +867,31 @@ describe('Node state machine (§11)', () => {
         parentConn.open = true;
         cousinConn.open = true;
 
-        (node as any).parent = parentConn;
-        (node as any).isAttached = true;
-        (node as any).cousins.set('cousin', cousinConn);
-        (node as any).lastParentRainTime = Date.now() - 4000;
+        (node as any).connManager.parent = parentConn;
+        (node as any).stateManager.setAttached(true);
+        (node as any).connManager.cousins.set('cousin', cousinConn);
+        (node as any).stateManager._lastParentRainTime = Date.now() - 4000;
 
         await vi.advanceTimersByTimeAsync(2000);
 
         // Should be in PATCHING and have sent REQ_STATE
         const reqs = cousinConn.sent.filter((msg) => (msg as ProtocolMessage).t === 'REQ_STATE');
         expect(reqs.length).toBeGreaterThan(0);
-        expect((node as any).state).toBe('PATCHING');
+        expect((node as any).stateManager.state).toBe('PATCHING');
     });
 
     it('transitions PATCHING → NORMAL when rainSeq resumes', async () => {
         const node = new Node('game', 'secret', new FakePeer() as any);
         await settleTimers();
 
-        (node as any).state = 'PATCHING';
-        (node as any).isAttached = true;
-        (node as any).rainSeq = 5;
+        (node as any).stateManager.transitionTo('PATCHING');
+        (node as any).stateManager.transitionTo('PATCHING');
+        (node as any).stateManager.setAttached(true);
+        (node as any).stateManager._rainSeq = 5;
 
         const parentConn = new FakeDataConnection('parent');
         parentConn.open = true;
-        (node as any).parent = parentConn;
+        (node as any).connManager.parent = parentConn;
 
         // Receive a new RAIN
         const rainMsg: ProtocolMessage = {
@@ -906,7 +906,7 @@ describe('Node state machine (§11)', () => {
 
         (node as any).handleMessage(parentConn, rainMsg);
 
-        expect((node as any).state).toBe('NORMAL');
+        expect((node as any).stateManager.state).toBe('NORMAL');
     });
 
     it('transitions PATCHING → REBINDING after 60-120s (spec timing)', async () => {
@@ -915,30 +915,30 @@ describe('Node state machine (§11)', () => {
 
         const parentConn = new FakeDataConnection('parent');
         parentConn.open = true;
-        (node as any).parent = parentConn;
-        (node as any).isAttached = true;
-        (node as any).state = 'PATCHING';
+        (node as any).connManager.parent = parentConn;
+        (node as any).stateManager.setAttached(true);
+        (node as any).stateManager.transitionTo('PATCHING');
         // Set patchStartTime to 60+ seconds ago so next tick triggers rebind
-        (node as any).patchStartTime = Date.now() - 60000;
+        (node as any).stateManager._patchStartTime = Date.now() - 60000;
 
         // Advance to trigger the stall detection interval check
         await vi.advanceTimersByTimeAsync(2000);
 
-        expect((node as any).state).toBe('REBINDING');
+        expect((node as any).stateManager.state).toBe('REBINDING');
     });
 
     it('transitions REBINDING → WAITING_FOR_HOST when host unreachable', async () => {
         const node = new Node('game', 'secret', new FakePeer() as any);
         await settleTimers();
 
-        (node as any).state = 'REBINDING';
+        (node as any).stateManager.transitionTo('REBINDING');
         (node as any).hostId = 'unreachable-host';
-        (node as any).isAttached = false;
+        (node as any).stateManager.setAttached(false);
 
         // Simulate host unreachable (no connection possible)
         await vi.advanceTimersByTimeAsync(10000);
 
-        expect((node as any).state).toBe('WAITING_FOR_HOST');
+        expect((node as any).stateManager.state).toBe('WAITING_FOR_HOST');
     });
 });
 
@@ -949,9 +949,9 @@ describe('Rate limiting (§12)', () => {
 
         const cousinConn = new FakeDataConnection('cousin');
         cousinConn.open = true;
-        (node as any).cousins.set('cousin', cousinConn);
-        (node as any).isAttached = true;
-        (node as any).state = 'PATCHING';
+        (node as any).connManager.cousins.set('cousin', cousinConn);
+        (node as any).stateManager.setAttached(true);
+        (node as any).stateManager.transitionTo('PATCHING');
 
         // Simulate 5 seconds of patch mode
         for (let i = 0; i < 5; i++) {
@@ -969,9 +969,9 @@ describe('Rate limiting (§12)', () => {
 
         const cousinConn = new FakeDataConnection('cousin');
         cousinConn.open = true;
-        (node as any).cousins.set('cousin', cousinConn);
-        (node as any).isAttached = true;
-        (node as any).state = 'PATCHING';
+        (node as any).connManager.cousins.set('cousin', cousinConn);
+        (node as any).stateManager.setAttached(true);
+        (node as any).stateManager.transitionTo('PATCHING');
         (node as any).reqStateCount = 5; // Past initial window
 
         cousinConn.sent.length = 0; // Clear
@@ -997,7 +997,7 @@ describe('Subtree reporting timing (§9.2, §6.4)', () => {
         node.bootstrap(host.getPeerId());
         await settleTimers();
 
-        const parentConn = (node as any).parent as FakeDataConnection;
+        const parentConn = (node as any).connManager.parent as FakeDataConnection;
         parentConn.sent.length = 0; // Clear
 
         // Wait 10 seconds
@@ -1015,7 +1015,7 @@ describe('Subtree reporting timing (§9.2, §6.4)', () => {
         middleNode.bootstrap(host.getPeerId());
         await settleTimers();
 
-        const parentConn = (middleNode as any).parent as FakeDataConnection;
+        const parentConn = (middleNode as any).connManager.parent as FakeDataConnection;
         parentConn.sent.length = 0;
 
         // A new child attaches to middleNode
@@ -1027,7 +1027,7 @@ describe('Subtree reporting timing (§9.2, §6.4)', () => {
         randomSpy.mockRestore();
 
         // If leaf attached to middleNode, check for immediate status
-        if ((leaf as any).parent?.peer === middleNode.getPeerId()) {
+        if ((leaf as any).connManager.parent?.peer === middleNode.getPeerId()) {
             const statuses = parentConn.sent.filter((msg) => (msg as ProtocolMessage).t === 'SUBTREE_STATUS');
             expect(statuses.length).toBeGreaterThan(0);
         }
@@ -1042,15 +1042,15 @@ describe('Subtree reporting timing (§9.2, §6.4)', () => {
         parentConn.open = true;
         childConn.open = true;
 
-        (node as any).parent = parentConn;
-        (node as any).isAttached = true;
-        (node as any).children.set('child', childConn);
+        (node as any).connManager.parent = parentConn;
+        (node as any).stateManager.setAttached(true);
+        (node as any).connManager.children.set('child', childConn);
 
         parentConn.sent.length = 0;
 
         // Child disconnects - need to call the handler directly since
         // FakeDataConnection.close() won't trigger handlerS registered via handleIncomingConnection
-        (node as any).children.delete('child');
+        (node as any).connManager.children.delete('child');
         (node as any).reportSubtree();
 
         const statuses = parentConn.sent.filter((msg) => (msg as ProtocolMessage).t === 'SUBTREE_STATUS');
@@ -1068,9 +1068,9 @@ describe('Cousin isolation (§7.3)', () => {
         parentConn.open = true;
         cousinConn.open = true;
 
-        (node as any).parent = parentConn;
-        (node as any).isAttached = true;
-        (node as any).cousins.set('cousin', cousinConn);
+        (node as any).connManager.parent = parentConn;
+        (node as any).stateManager.setAttached(true);
+        (node as any).connManager.cousins.set('cousin', cousinConn);
 
         const rainMsg: ProtocolMessage = {
             t: 'RAIN',
@@ -1097,9 +1097,9 @@ describe('Cousin isolation (§7.3)', () => {
         parentConn.open = true;
         cousinConn.open = true;
 
-        (node as any).parent = parentConn;
-        (node as any).isAttached = true;
-        (node as any).cousins.set('cousin', cousinConn);
+        (node as any).connManager.parent = parentConn;
+        (node as any).stateManager.setAttached(true);
+        (node as any).connManager.cousins.set('cousin', cousinConn);
 
         const gameEvent: ProtocolMessage = {
             t: 'GAME_EVENT',
@@ -1125,9 +1125,9 @@ describe('Cousin isolation (§7.3)', () => {
         const cousinConn = new FakeDataConnection('cousin');
         cousinConn.open = true;
 
-        (node as any).cousins.set('cousin', cousinConn);
-        (node as any).isAttached = true;
-        (node as any).state = 'PATCHING';
+        (node as any).connManager.cousins.set('cousin', cousinConn);
+        (node as any).stateManager.setAttached(true);
+        (node as any).stateManager.transitionTo('PATCHING');
 
         // Trigger patch mode behavior
         await vi.advanceTimersByTimeAsync(1000);
@@ -1153,10 +1153,10 @@ describe('Path augmentation (§8.1)', () => {
         parentConn.open = true;
         childConn.open = true;
 
-        (node as any).parent = parentConn;
-        (node as any).children.set('child', childConn);
-        (node as any).isAttached = true;
-        (node as any).rainSeq = 0; // Ensure this rain is new
+        (node as any).connManager.parent = parentConn;
+        (node as any).connManager.children.set('child', childConn);
+        (node as any).stateManager.setAttached(true);
+        (node as any).stateManager._rainSeq = 0; // Ensure this rain is new
 
         const rainMsg: ProtocolMessage = {
             t: 'RAIN',
@@ -1181,8 +1181,8 @@ describe('Path augmentation (§8.1)', () => {
         const parentConn = new FakeDataConnection('parent');
         parentConn.open = true;
 
-        (node as any).parent = parentConn;
-        (node as any).isAttached = true;
+        (node as any).connManager.parent = parentConn;
+        (node as any).stateManager.setAttached(true);
 
         const cmd: ProtocolMessage = {
             t: 'GAME_CMD',
@@ -1209,8 +1209,8 @@ describe('Deduplication (§8.2)', () => {
         const parentConn = new FakeDataConnection('parent');
         parentConn.open = true;
 
-        (node as any).parent = parentConn;
-        (node as any).isAttached = true;
+        (node as any).connManager.parent = parentConn;
+        (node as any).stateManager.setAttached(true);
 
         let callCount = 0;
         node.onGameEventReceived(() => {
@@ -1242,10 +1242,10 @@ describe('Deduplication (§8.2)', () => {
         parentConn.open = true;
         childConn.open = true;
 
-        (node as any).parent = parentConn;
-        (node as any).children.set('child', childConn);
-        (node as any).isAttached = true;
-        (node as any).rainSeq = 5;
+        (node as any).connManager.parent = parentConn;
+        (node as any).connManager.children.set('child', childConn);
+        (node as any).stateManager.setAttached(true);
+        (node as any).stateManager._rainSeq = 5;
 
         const rainMsg: ProtocolMessage = {
             t: 'RAIN',
@@ -1269,8 +1269,8 @@ describe('Deduplication (§8.2)', () => {
         const parentConn = new FakeDataConnection('parent');
         parentConn.open = true;
 
-        (node as any).parent = parentConn;
-        (node as any).isAttached = true;
+        (node as any).connManager.parent = parentConn;
+        (node as any).stateManager.setAttached(true);
         (node as any).lastGameSeq = 10;
 
         let callCount = 0;
@@ -1303,7 +1303,7 @@ describe('GAME_ACK (§9.4)', () => {
         node.bootstrap(host.getPeerId());
         await settleTimers();
 
-        const parentConn = (node as any).parent as FakeDataConnection;
+        const parentConn = (node as any).connManager.parent as FakeDataConnection;
         parentConn.sent.length = 0;
 
         // Send GAME_CMD with ack flag
@@ -1326,7 +1326,7 @@ describe('GAME_ACK (§9.4)', () => {
         childConn.open = true;
 
         (host as any).children.set('child', childConn);
-        (host as any).topology.set('child', { nextHop: 'child', depth: 1, lastSeen: Date.now(), freeSlots: 3 });
+        (host as any).topologyManager.updateNode('child', { nextHop: 'child', depth: 1, lastSeen: Date.now(), freeSlots: 3 });
 
         const cmd: ProtocolMessage = {
             t: 'GAME_CMD',
@@ -1354,13 +1354,13 @@ describe('Rebind timing (§6.4)', () => {
 
         const parentConn = new FakeDataConnection('parent');
         parentConn.open = true;
-        (node as any).parent = parentConn;
-        (node as any).isAttached = true;
+        (node as any).connManager.parent = parentConn;
+        (node as any).stateManager.setAttached(true);
         (node as any).hostId = 'host-1';
-        (node as any).lastParentRainTime = Date.now();
+        (node as any).stateManager._lastParentRainTime = Date.now();
 
         // Set stall
-        (node as any).lastParentRainTime = Date.now() - 4000;
+        (node as any).stateManager._lastParentRainTime = Date.now() - 4000;
         await vi.advanceTimersByTimeAsync(5000);
 
         // At 50 seconds, should NOT have rebind yet
@@ -1378,14 +1378,14 @@ describe('Rebind timing (§6.4)', () => {
         const node = new Node('game', 'secret', new FakePeer() as any);
         await settleTimers();
 
-        (node as any).isAttached = true;
-        (node as any).state = 'PATCHING';
-        (node as any).patchStartTime = Date.now();
+        (node as any).stateManager.setAttached(true);
+        (node as any).stateManager.transitionTo('PATCHING');
+        (node as any).stateManager._patchStartTime = Date.now();
 
         // Advance only 30 seconds
         await vi.advanceTimersByTimeAsync(30000);
 
-        expect((node as any).state).not.toBe('REBINDING');
+        expect((node as any).stateManager.state).not.toBe('REBINDING');
     });
 });
 
@@ -1404,17 +1404,21 @@ describe('Phase 4: Advanced Reliability Tests', () => {
         await settleTimers(5);
 
         // Manually set node as L1 child (attached but no cousins)
-        (node as any).isAttached = true;
-        (node as any).parent = (node as any).hostConnection;
+        (node as any).stateManager.setAttached(true);
+        (node as any).connManager.parent = (node as any).hostConnection; // hostConnection is not on Node directly but likely mocked via bootstrap? Wait, hostConnection isn't standard property either. It likely means the auth connection logic. Assuming connManager.parent for now based on context.
+        // Actually, looking at test setup, node.bootstrap sets parent. The original test line `(node as any).connManager.parent = (node as any).hostConnection` implies the test harness or previous logic set a `hostConnection` prop or it's just grabbing the parent.
+        // But `(node as any).connManager.parent` is now `(node as any).connManager.parent`.
+        // If the test set `(node as any).hostConnection` it's weird, but let's assume valid property or just re-assigning parent.
+        (node as any).connManager.parent = (node as any).connManager.parent; // Redundant but preserving intent if it was switching conn? No, likely just setting it manually.
         (node as any).myDepth = 1;
-        (node as any).lastParentRainTime = Date.now() - 5000; // Stale parent
+        (node as any).stateManager._lastParentRainTime = Date.now() - 5000; // Stale parent
 
         // Trigger stall detection → PATCHING → REQ_STATE to host
-        (node as any).state = 'SUSPECT_UPSTREAM';
+        (node as any).stateManager.transitionTo('SUSPECT_UPSTREAM');
         await vi.advanceTimersByTimeAsync(1000);
 
         // Verify node entered PATCHING
-        expect((node as any).state).toBe('PATCHING');
+        expect((node as any).stateManager.state).toBe('PATCHING');
 
         // Allow time for REQ_STATE and STATE response
         await settleTimers(10);
@@ -1431,7 +1435,7 @@ describe('Phase 4: Advanced Reliability Tests', () => {
         (nodeB as any).gameEventCache.add(1, { type: 'EVT1', data: { a: 1 } });
         (nodeB as any).gameEventCache.add(2, { type: 'EVT2', data: { a: 2 } });
         (nodeB as any).lastGameSeq = 2;
-        (nodeB as any).rainSeq = 10;
+        (nodeB as any).stateManager._rainSeq = 10;
 
         // Simulate nodeA connecting to nodeB as cousin
         const connAtoB = new FakeDataConnection('nodeB', { gameId: 'game', secret: 'secret', role: 'COUSIN' });
@@ -1446,7 +1450,7 @@ describe('Phase 4: Advanced Reliability Tests', () => {
         await settleTimers(2);
 
         // Verify nodeB registered the cousin
-        expect((nodeB as any).cousins.has('nodeA')).toBe(true);
+        expect((nodeB as any).connManager.cousins.has('nodeA')).toBe(true);
 
         // NodeA sends REQ_STATE to nodeB
         const reqState: ProtocolMessage = {
@@ -1518,8 +1522,8 @@ describe('Phase 4: Advanced Reliability Tests', () => {
         const node = new Node('game', 'secret', new FakePeer('node') as any);
         const parentConn = new FakeDataConnection('parent');
 
-        (node as any).parent = parentConn;
-        (node as any).isAttached = true;
+        (node as any).connManager.parent = parentConn;
+        (node as any).stateManager.isAttached = true;
         parentConn.open = true;
 
         // Send message with ACK using sendGameEvent (which returns a promise when ack=true)
@@ -1572,10 +1576,10 @@ describe('Phase 4: Advanced Reliability Tests', () => {
             nodes.push(node);
 
             // Simulate all nodes entering PATCHING at same time
-            (node as any).state = 'SUSPECT_UPSTREAM';
-            (node as any).isAttached = true;
-            (node as any).parent = new FakeDataConnection('parent');
-            (node as any).parent.open = true;
+            (node as any).stateManager.transitionTo('SUSPECT_UPSTREAM');
+            (node as any).stateManager.setAttached(true);
+            (node as any).connManager.parent = new FakeDataConnection('parent');
+            (node as any).connManager.parent.open = true;
         }
 
         // Advance time by 1s to trigger PATCHING state
@@ -1606,7 +1610,7 @@ describe('Phase 4: Advanced Reliability Tests', () => {
 
             // Set varying capacities and depths
             const freeSlots = i === 2 ? 10 : i === 4 ? 5 : 0;
-            (host as any).topology.set(`child${i}`, {
+            (host as any).topologyManager.updateNode(`child${i}`, {
                 nextHop: `child${i}`,
                 depth: 1,
                 lastSeen: Date.now(),

@@ -102,7 +102,7 @@ export class ProtocolSimulation {
             if (snap.depth !== 2) continue;
             if (snap.children.length === 0) continue;
             const node = this.getNode(id) as any;
-            const cousinsSize = (node.cousins?.size as number | undefined) ?? 0;
+            const cousinsSize = (node.connManager.cousins?.size as number | undefined) ?? 0;
             if (cousinsSize <= 0) continue;
 
             const parentId = snap.parentId;
@@ -127,10 +127,10 @@ export class ProtocolSimulation {
     public crashNode(id: string) {
         const node = this.getNode(id) as any;
 
-        const parent = node.parent as { close?: () => void } | null;
+        const parent = node.connManager.parent as { close?: () => void } | null;
         if (parent?.close) parent.close();
 
-        const children = node.children as Map<string, { close?: () => void }>;
+        const children = node.connManager.children as Map<string, { close?: () => void }>;
         if (children) {
             for (const conn of children.values()) {
                 conn.close?.();
@@ -186,10 +186,12 @@ export class ProtocolSimulation {
 
     public async stabilize({
         minRainSeq = 5,
-        timeoutMs = 60_000
+        timeoutMs = 60_000,
+        maxLag = 2
     }: {
         minRainSeq?: number;
         timeoutMs?: number;
+        maxLag?: number;
     } = {}) {
         await this.waitFor(() => ((this.host as any).rainSeq as number) >= minRainSeq, timeoutMs, 250);
         await this.waitFor(
@@ -210,11 +212,11 @@ export class ProtocolSimulation {
 
         this.assertTreeFormed();
         this.assertConnectionsOpen();
-        this.assertRainPropagating();
+        this.assertRainPropagating({ maxLag });
     }
 
     private isHostTopologyComplete(): boolean {
-        const topology = (this.host as any).topology as Map<string, unknown> | undefined;
+        const topology = (this.host as any).topologyManager.topology as Map<string, unknown> | undefined;
         if (!topology) return false;
         return this.nodeIdsInOrder.every((id) => topology.has(id));
     }
@@ -252,12 +254,12 @@ export class ProtocolSimulation {
             const node = this.getNode(id) as any;
             const snap = this.getSnapshot(id);
 
-            const parentConn = node.parent as { open?: boolean; peer?: string } | null;
+            const parentConn = node.connManager.parent as { open?: boolean; peer?: string } | null;
             expect(parentConn).toBeTruthy();
             expect(parentConn?.open).toBe(true);
             expect(parentConn?.peer).toBe(snap.parentId);
 
-            const children = node.children as Map<string, { open?: boolean }>;
+            const children = node.connManager.children as Map<string, { open?: boolean }>;
             for (const childId of snap.children) {
                 const conn = children.get(childId);
                 expect(conn).toBeTruthy();

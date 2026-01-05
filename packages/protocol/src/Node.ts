@@ -7,9 +7,9 @@ import {
     AttachAccept,
     AttachReject,
     SubtreeStatus,
+    RebindAssign,
     ReqCousins,
-    CousinsMessage,
-    RebindAssign
+    CousinsMessage
 } from './types.js';
 import {
     DeduplicationCache,
@@ -28,7 +28,10 @@ import {
     createReqPayloadMessage,
     addToPath
 } from './utils/index.js';
+import { NodeStateManager } from './node/NodeStateManager.js';
+import { NodeConnectionManager } from './node/NodeConnectionManager.js';
 
+// Re-export NodeState for compatibility or just use it from manager
 export enum NodeState {
     NORMAL = 'NORMAL',
     SUSPECT_UPSTREAM = 'SUSPECT_UPSTREAM',
@@ -42,27 +45,21 @@ export class Node {
     private gameId: string;
     private secret: string;
 
-    // Parent Connection
-    private parent: DataConnection | null = null;
+    // Managers
+    private stateManager: NodeStateManager;
+    private connManager: NodeConnectionManager;
 
     // Topology Learning
     private seeds: string[] = [];
 
-    // Children (Acting as Parent)
-    private children: Map<string, DataConnection> = new Map();
+    // Children Metadata
     private childDescendants: Map<string, { id: string, hops: number, freeSlots: number }[]> = new Map();
     private childCapacities: Map<string, number> = new Map();
 
     private MAX_CHILDREN = 3;
 
-    // State
-    private rainSeq: number = 0;
-    private lastRainTime: number = Date.now();
-    private isAttached = false;
     private subtreeInterval: NodeJS.Timeout | null = null;
     private myDepth: number = 0;
-    private state: NodeState = NodeState.NORMAL;
-    private patchStartTime: number = 0;
 
     // Simulation Controls
     private _paused: boolean = false;
@@ -72,10 +69,7 @@ export class Node {
     // Callback for game events
     private onGameEvent: ((type: string, data: unknown, from: string) => void) | null = null;
 
-    // Cousin connections for patch mode (S=2 connections at same depth, different parent)
-    private cousins: Map<string, DataConnection> = new Map();
     private lastGameSeq: number = 0;
-    private lastParentRainTime: number = Date.now();
     private stallDetectionInterval: NodeJS.Timeout | null = null;
     private lastReqStateTime: number = 0; // Track when we last sent REQ_STATE
     private reqStateTarget: 'COUSIN' | 'HOST' | null = null; // Track where we sent REQ_STATE
@@ -93,7 +87,6 @@ export class Node {
 
     // Descendant routing map: descendantId -> nextHop childId
     private descendantToNextHop: Map<string, string> = new Map();
-    private descendantsCount: number = 0;
 
     // Utility classes
     private dedupCache: DeduplicationCache;
@@ -108,6 +101,10 @@ export class Node {
         this.secret = secret;
         this.peer = peer;
         if (logger) this._logger = logger;
+
+        // Initialize Managers
+        this.stateManager = new NodeStateManager((msg) => this.log(msg));
+        this.connManager = new NodeConnectionManager(peer, (msg) => this.log(msg));
 
         // Initialize utility classes
         this.dedupCache = new DeduplicationCache(100);
@@ -151,11 +148,7 @@ export class Node {
     }
 
     public getHealthStatus(): 'HEALTHY' | 'DEGRADED' | 'OFFLINE' {
-        if (!this.isAttached) return 'OFFLINE';
-        const timeSinceRain = Date.now() - this.lastRainTime;
-        if (timeSinceRain > 5000) return 'OFFLINE'; // > 5s no rain
-        if (timeSinceRain > 2000) return 'DEGRADED'; // > 2s no rain
-        return 'HEALTHY';
+        return this.stateManager.getHealthStatus();
     }
 
     /**
@@ -260,8 +253,8 @@ export class Node {
                 if (msg.keepAlive) {
                     // Optimization: Host kept us as a child.
                     this.log('[Node] Host kept connection. Attached as L1.');
-                    this.parent = conn;
-                    this.isAttached = true;
+                    this.connManager.setParent(conn);
+                    this.stateManager.setAttached(true);
                     this.myDepth = 1; // Host is L0
                     this.emitState();
 
@@ -274,8 +267,8 @@ export class Node {
 
                     conn.on('close', () => {
                         this.log('[Node] Parent (Host) connection closed');
-                        this.parent = null;
-                        this.isAttached = false;
+                        this.connManager.setParent(null);
+                        this.stateManager.setAttached(false);
                         this.emitState();
                         // When a live parent connection drops, re-enter attach flow promptly.
                         // Clear seeds so we preferentially re-auth to host (as an L1).
@@ -309,7 +302,7 @@ export class Node {
                 this.log(`[Node] Retrying auth in 500ms... (Attempt ${this.authAttempts + 1}/5)`);
                 this.authAttempts++;
                 setTimeout(() => {
-                    if (!this.isAttached) this.authenticateWithHost(hostId);
+                    if (!this.stateManager.isAttached) this.authenticateWithHost(hostId);
                 }, 500 + Math.random() * 500);
             }
         });
@@ -321,8 +314,8 @@ export class Node {
 
     // Step B: Attach to Network (Recursive with robustness)
     private attemptAttachToNetwork() {
-        this.log(`[Node] attemptAttachToNetwork called. isAttached=${this.isAttached}, attempts=${this.attachAttempts}, seeds=${JSON.stringify(this.seeds)}`);
-        if (this.isAttached) {
+        this.log(`[Node] attemptAttachToNetwork called. isAttached=${this.stateManager.isAttached}, attempts=${this.attachAttempts}, seeds=${JSON.stringify(this.seeds)}`);
+        if (this.stateManager.isAttached) {
             this.log('[Node] Already attached, skipping attemptAttachToNetwork');
             return;
         }
@@ -414,8 +407,8 @@ export class Node {
     private handleAttachResponse(conn: DataConnection, msg: ProtocolMessage) {
         if (msg.t === 'ATTACH_ACCEPT') {
             this.log(`[Node] Attached to parent ${conn.peer}`);
-            this.parent = conn;
-            this.isAttached = true;
+            this.connManager.setParent(conn);
+            this.stateManager.setAttached(true);
             this.myDepth = (msg.level || 0) + 1;
 
             // Reset counters on success
@@ -432,8 +425,8 @@ export class Node {
 
             conn.on('close', () => {
                 this.log('[Node] Parent connection closed');
-                this.parent = null;
-                this.isAttached = false;
+                this.connManager.setParent(null);
+                this.stateManager.setAttached(false);
                 this.emitState();
                 // Parent disconnects should trigger a prompt re-attach attempt (crash handling).
                 this.scheduleAttachRetry();
@@ -477,9 +470,9 @@ export class Node {
             return;
         }
 
-        const isFromParent = this.parent && conn.peer === this.parent.peer;
-        const isFromChild = this.children.has(conn.peer);
-        const isFromCousin = this.cousins.has(conn.peer);
+        const isFromParent = this.connManager.parent && conn.peer === this.connManager.parent.peer;
+        const isFromChild = this.connManager.children.has(conn.peer);
+        // const isFromCousin = this.connManager.cousins.has(conn.peer); // Used implicitly in routing
 
         // Check if message needs routing (has a dest that's not us)
         if (msg.dest && msg.dest !== this.peer.id) {
@@ -488,23 +481,15 @@ export class Node {
 
             // Special handling for HOST destination - always route upward
             if (forwardedMsg.dest === 'HOST') {
-                if (this.parent && this.parent.open) {
-                    this.log(`[Node] Routing ${forwardedMsg.t} UP to HOST`);
-                    this.parent.send(forwardedMsg);
-                } else {
-                    this.log(`[Node] Cannot route to HOST - no parent connection, dropping message`);
-                }
+                this.log(`[Node] Routing ${forwardedMsg.t} UP to HOST`);
+                this.connManager.sendToParent(forwardedMsg);
                 return;
             }
 
             if (isFromChild) {
                 // Came from DOWN → route UP (toward Host)
-                if (this.parent && this.parent.open) {
-                    this.log(`[Node] Routing ${forwardedMsg.t} UP to parent (dest: ${forwardedMsg.dest})`);
-                    this.parent.send(forwardedMsg);
-                } else {
-                    this.log(`[Node] Cannot route UP - no parent connection`);
-                }
+                this.log(`[Node] Routing ${forwardedMsg.t} UP to parent (dest: ${forwardedMsg.dest})`);
+                this.connManager.sendToParent(forwardedMsg);
             } else if (isFromParent) {
                 // Came from UP → route DOWN using explicit route or descendant map
                 let nextHop: string | undefined;
@@ -521,14 +506,12 @@ export class Node {
                     nextHop = this.descendantToNextHop.get(forwardedMsg.dest);
                 }
 
-                if (nextHop && this.children.has(nextHop)) {
+                if (nextHop && this.connManager.children.has(nextHop)) {
                     this.log(`[Node] Routing ${forwardedMsg.t} DOWN to next hop ${nextHop} (dest: ${forwardedMsg.dest})`);
-                    this.children.get(nextHop)!.send(forwardedMsg);
+                    this.connManager.children.get(nextHop)!.send(forwardedMsg);
                 } else {
                     this.log(`[Node] No route found for child ${forwardedMsg.dest}, routing UP to parent as fallback`);
-                    if (this.parent && this.parent.open) {
-                        this.parent.send(forwardedMsg);
-                    }
+                    this.connManager.sendToParent(forwardedMsg);
                 }
             }
             return;
@@ -538,25 +521,14 @@ export class Node {
         switch (msg.t) {
             case 'RAIN':
                 if (isFromParent) {
-                    // Dedupe by sequence too
-                    if (msg.rainSeq <= this.rainSeq) return;
-
-                    this.rainSeq = msg.rainSeq;
-                    this.lastRainTime = Date.now();
-                    this.lastParentRainTime = Date.now(); // Track for stall detection
-
-                    if (this.state !== NodeState.NORMAL) {
-                        this.log(`[Node] Received RAIN from parent, transitioning to NORMAL`);
-                        this.state = NodeState.NORMAL;
-                        this.patchStartTime = 0;
-                        this.reqStateCount = 0;
-                    }
+                    const updated = this.stateManager.processRain(msg.rainSeq, true);
+                    if (!updated) return;
 
                     this.reqStateTarget = null;
                     this.emitState();
 
                     const forwardedMsg = addToPath(msg, this.peer.id);
-                    this.broadcast(forwardedMsg);
+                    this.connManager.broadcast(forwardedMsg);
                 }
                 break;
 
@@ -571,7 +543,7 @@ export class Node {
                 this.log(`[Node] PING received from ${msg.src}, sending PONG`);
                 const pongMsg = createPongMessage(this.gameId, this.peer.id, msg.msgId, msg.src, msg.path);
                 // Route using the reverse path (may go through cousins)
-                this.routeReply(pongMsg, conn);
+                this.connManager.routeReply(pongMsg, conn);
                 break;
 
             case 'PONG':
@@ -612,7 +584,7 @@ export class Node {
                 if (msg.ack) {
                     const ackMsg = createAckMessage(this.gameId, this.peer.id, msg.msgId, msg.src, msg.path);
                     // Route using the reverse path
-                    this.routeReply(ackMsg, conn);
+                    this.connManager.routeReply(ackMsg, conn);
                 }
                 // Notify callback if registered
                 if (this.onGameEvent && msg.event) {
@@ -622,7 +594,7 @@ export class Node {
                 // Broadcast to children if from parent (tree propagation)
                 if (isFromParent) {
                     const forwardedMsg = addToPath(msg, this.peer.id);
-                    this.broadcast(forwardedMsg);
+                    this.connManager.broadcast(forwardedMsg);
                 }
                 break;
 
@@ -647,7 +619,7 @@ export class Node {
                     this.peer.id,
                     msg.msgId,
                     msg.src,
-                    this.rainSeq,
+                    this.stateManager.rainSeq,
                     this.lastGameSeq,
                     eventsToSend,
                     minSeqInCache,
@@ -656,7 +628,7 @@ export class Node {
                 );
 
                 // Route using the reverse path
-                this.routeReply(stateMsg, conn);
+                this.connManager.routeReply(stateMsg, conn);
                 break;
 
             case 'STATE':
@@ -693,15 +665,13 @@ export class Node {
                     // Forward only new repaired events downstream
                     newEvents.forEach(({ seq, event }) => {
                         const gameEvent = createGameEvent(this.gameId, this.peer.id, seq, event.type, event.data);
-                        this.broadcast(gameEvent);
+                        this.connManager.broadcast(gameEvent);
                     });
                 }
 
-                if (msg.latestRainSeq > this.rainSeq) {
-                    this.log(`[Node] STATE advanced rainSeq from ${this.rainSeq} to ${msg.latestRainSeq}. Forwarding RAIN downstream.`);
-                    this.rainSeq = msg.latestRainSeq;
-                    this.lastRainTime = Date.now();
-                    this.lastParentRainTime = Date.now(); // Reset stall timer
+                if (msg.latestRainSeq > this.stateManager.rainSeq) {
+                    this.log(`[Node] STATE advanced rainSeq from ${this.stateManager.rainSeq} to ${msg.latestRainSeq}. Forwarding RAIN downstream.`);
+                    this.stateManager.processRain(msg.latestRainSeq, true);
 
                     // Synthesize a RAIN message to heal children
                     const rainMsg: ProtocolMessage = {
@@ -710,10 +680,10 @@ export class Node {
                         gameId: this.gameId,
                         src: this.peer.id, // We are the source of this synthetic rain
                         msgId: uuidv4(),
-                        rainSeq: this.rainSeq,
+                        rainSeq: this.stateManager.rainSeq,
                         path: [this.peer.id]
                     };
-                    this.broadcast(rainMsg);
+                    this.connManager.broadcast(rainMsg);
                 }
 
                 this.reqStateTarget = null; // Reset since we got a response
@@ -729,7 +699,7 @@ export class Node {
                 const requesterHops = targetDepth - this.myDepth; // How many hops down from us
 
                 // Look through other children's descendants at the same depth
-                this.children.forEach((childConn, childId) => {
+                this.connManager.children.forEach((childConn, childId) => {
                     // Skip the requester's branch
                     if (childId === msg.src || this.descendantToNextHop.get(msg.src) === childId) {
                         return;
@@ -786,12 +756,12 @@ export class Node {
                     );
 
                     // Route back to requester using reverse path
-                    this.routeReply(cousinsMsg, conn);
+                    this.connManager.routeReply(cousinsMsg, conn);
                 } else {
                     // No local candidates, forward upstream if possible
                     this.log(`[Node] No local cousins found, forwarding REQ_COUSINS upstream`);
-                    if (this.parent && this.parent.open) {
-                        this.parent.send(msg);
+                    if (this.connManager.parent && this.connManager.parent.open) {
+                        this.connManager.parent.send(msg);
                     } else {
                         // Send empty response
                         const cousinsMsg = createCousinsMessage(
@@ -802,7 +772,7 @@ export class Node {
                             [],
                             msg.path
                         );
-                        this.routeReply(cousinsMsg, conn);
+                        this.connManager.routeReply(cousinsMsg, conn);
                     }
                 }
                 break;
@@ -814,7 +784,7 @@ export class Node {
                 // Attempt to connect to cousins (up to 2)
                 const candidatesToTry = msg.candidates.slice(0, 2);
                 candidatesToTry.forEach(cousinId => {
-                    if (!this.cousins.has(cousinId) && cousinId !== this.peer.id) {
+                    if (!this.connManager.cousins.has(cousinId) && cousinId !== this.peer.id) {
                         this.connectToCousin(cousinId);
                     }
                 });
@@ -830,14 +800,14 @@ export class Node {
     private startSubtreeReporting() {
         if (this.subtreeInterval) return;
         this.subtreeInterval = setInterval(() => {
-            if (this.parent && this.parent.open) {
+            if (this.connManager.parent && this.connManager.parent.open) {
                 this.reportSubtree();
             }
         }, 5000);
     }
 
     private reportSubtree() {
-        if (!this.parent) return;
+        if (!this.connManager.parent) return;
 
         let myDescendants: { id: string, hops: number, freeSlots: number }[] = [];
         let myChildrenStatus: { id: string, state: string, lastRainSeq: number, freeSlots: number }[] = [];
@@ -845,12 +815,12 @@ export class Node {
         // Rebuild descendant-to-nextHop map
         this.descendantToNextHop.clear();
 
-        this.children.forEach((conn, childId) => {
+        this.connManager.children.forEach((conn, childId) => {
             const childCapacity = this.childCapacities.get(childId) || 0;
 
             // Direct child
             myDescendants.push({ id: childId, hops: 1, freeSlots: childCapacity });
-            myChildrenStatus.push({ id: childId, state: 'OK', lastRainSeq: this.rainSeq, freeSlots: childCapacity });
+            myChildrenStatus.push({ id: childId, state: 'OK', lastRainSeq: this.stateManager.rainSeq, freeSlots: childCapacity });
 
             // Map direct child to itself
             this.descendantToNextHop.set(childId, childId);
@@ -866,7 +836,7 @@ export class Node {
             }
         });
 
-        const reportedChildren = Array.from(this.childDescendants.keys()).filter((id) => this.children.has(id)).length;
+        const reportedChildren = Array.from(this.childDescendants.keys()).filter((id) => this.connManager.children.has(id)).length;
         let totalDescendants = 0;
         this.childDescendants.forEach((list) => {
             totalDescendants += list.length;
@@ -879,15 +849,15 @@ export class Node {
             gameId: this.gameId,
             src: this.peer.id,
             msgId: uuidv4(),
-            lastRainSeq: this.rainSeq,
+            lastRainSeq: this.stateManager.rainSeq,
             state: 'OK',
             children: myChildrenStatus,
             subtreeCount: subtreeCount,
             descendants: myDescendants,
-            freeSlots: this.MAX_CHILDREN - this.children.size,
+            freeSlots: this.MAX_CHILDREN - this.connManager.children.size,
             path: [this.peer.id]
         };
-        this.parent.send(msg);
+        this.connManager.parent.send(msg);
     }
 
     // --- Parent Logic ---
@@ -909,7 +879,7 @@ export class Node {
 
         if (meta.role === 'COUSIN') {
             this.log(`[Node] Registered incoming COUSIN connection from ${conn.peer}`);
-            this.cousins.set(conn.peer, conn);
+            this.connManager.addCousin(conn);
         }
 
         // Register data handler immediately to avoid race with early messages.
@@ -933,8 +903,7 @@ export class Node {
 
         conn.on('close', () => {
             this.log(`[Node] Connection closed: ${conn.peer}`);
-            this.children.delete(conn.peer);
-            this.cousins.delete(conn.peer);
+            this.connManager.removeConnection(conn.peer);
             this.childDescendants.delete(conn.peer);
             this.childCapacities.delete(conn.peer);
             this.emitState();
@@ -944,11 +913,11 @@ export class Node {
     }
 
     private handleIncomingAttach(conn: DataConnection, msg: AttachRequest) {
-        if (this.children.size >= this.MAX_CHILDREN) {
+        if (this.connManager.children.size >= this.MAX_CHILDREN) {
             // Smart redirect: find descendants with free slots
             const candidates: string[] = [];
             // 1. Check direct children
-            this.children.forEach((childConn, childId) => {
+            this.connManager.children.forEach((childConn, childId) => {
                 if ((this.childCapacities.get(childId) || 0) > 0) {
                     candidates.push(childId);
                 }
@@ -979,7 +948,7 @@ export class Node {
             };
             conn.send(reject);
         } else {
-            this.children.set(conn.peer, conn);
+            this.connManager.addChild(conn);
             const accept: AttachAccept = {
                 t: 'ATTACH_ACCEPT',
                 v: 1,
@@ -990,7 +959,7 @@ export class Node {
                 level: this.myDepth,
                 cousinCandidates: [],
                 childrenMax: this.MAX_CHILDREN,
-                childrenUsed: this.children.size,
+                childrenUsed: this.connManager.children.size,
                 path: [this.peer.id]
             };
             conn.send(accept);
@@ -1005,89 +974,31 @@ export class Node {
         this.log(`[Node] REBIND_ASSIGN received with ${msg.newParentCandidates.length} candidates`);
 
         // Disconnect from current parent
-        if (this.parent) {
-            this.parent.close();
-            this.parent = null;
-            this.isAttached = false;
+        if (this.connManager.parent) {
+            this.connManager.parent.close();
+            this.connManager.setParent(null);
+            this.stateManager.setAttached(false);
         }
 
         this.seeds = msg.newParentCandidates;
         this.attachAttempts = 0;
-        this.state = NodeState.NORMAL; // Re-entering attach flow
+        this.stateManager.transitionTo(NodeState.NORMAL); // Re-entering attach flow
         this.scheduleAttachRetry();
     }
 
-    private broadcast(msg: ProtocolMessage) {
-        this.children.forEach(c => {
-            if (c.open) c.send(msg);
-        });
-    }
-
-    private routeReply(msg: ProtocolMessage, sourceConn: DataConnection) {
-        // Route a reply using explicit reverse-path routing
-        // This allows replies to traverse cousin links if they were in the original path
-
-        if (!msg.route || msg.route.length === 0) {
-            // No explicit route, just send back on same connection
-            sourceConn.send(msg);
-            return;
-        }
-
-        // Find our position in the route
-        const myIndex = msg.route.indexOf(this.peer.id);
-        let nextHopId: string;
-
-        if (myIndex === -1) {
-            // We are likely the originator of this reply (or start of route), so send to first hop
-            nextHopId = msg.route[0];
-        } else if (myIndex < msg.route.length - 1) {
-            // We are in the list, forward to next
-            nextHopId = msg.route[myIndex + 1];
-        } else {
-            // We're the destination (last in route), deliver locally (shouldn't happen for outgoing reply usually)
-            return;
-        }
-
-        // Try to find the connection (could be parent, child, or cousin)
-        let targetConn: DataConnection | null = null;
-
-        // Check if nextHop is parent
-        if (this.parent && this.parent.peer === nextHopId) {
-            targetConn = this.parent;
-        }
-        // Check children
-        else if (this.children.has(nextHopId)) {
-            targetConn = this.children.get(nextHopId)!;
-        }
-        // Check cousins
-        else if (this.cousins.has(nextHopId)) {
-            targetConn = this.cousins.get(nextHopId)!;
-        }
-
-        if (targetConn && targetConn.open) {
-            targetConn.send(msg);
-        } else if (sourceConn.open) {
-            // Fallback to the incoming connection when route lookup fails.
-            this.log(`[Node] Cannot route reply - next hop ${nextHopId} not connected. Falling back to sourceConn.`);
-            sourceConn.send(msg);
-        } else {
-            this.log(`[Node] Cannot route reply - next hop ${nextHopId} not connected. Route: ${JSON.stringify(msg.route)}`);
-        }
-    }
-
     public sendToHost(msg: ProtocolMessage) {
-        this.log(`[Node] sendToHost called. Parent: ${this.parent?.peer || 'NONE'}, Open: ${this.parent?.open || false}`);
-        if (this.parent && this.parent.open) {
+        this.log(`[Node] sendToHost called. Parent: ${this.connManager.parent?.peer || 'NONE'}, Open: ${this.connManager.parent?.open || false}`);
+        if (this.connManager.parent && this.connManager.parent.open) {
             msg.path = [this.peer.id];
-            this.parent.send(msg);
-            this.log(`[Node] Sent ${msg.t} to parent ${this.parent.peer}`);
+            this.connManager.parent.send(msg);
+            this.log(`[Node] Sent ${msg.t} to parent ${this.connManager.parent.peer}`);
         } else {
             this.log(`[Node] sendToHost FAILED - no open parent connection!`);
         }
     }
 
     public pingHost() {
-        this.log(`[Node] pingHost() called. isAttached=${this.isAttached}, depth=${this.myDepth}`);
+        this.log(`[Node] pingHost() called. isAttached=${this.stateManager.isAttached}, depth=${this.myDepth}`);
         const msgId = uuidv4();
 
         // Track send time for latency calculation
@@ -1104,14 +1015,14 @@ export class Node {
     }
 
     private requestCousins() {
-        this.log(`[Node] Requesting cousins (depth=${this.myDepth}). Parent: ${this.parent?.peer}, Open: ${this.parent?.open}`);
+        this.log(`[Node] Requesting cousins (depth=${this.myDepth}). Parent: ${this.connManager.parent?.peer}, Open: ${this.connManager.parent?.open}`);
 
-        if (!this.parent) return;
+        if (!this.connManager.parent) return;
 
         this.log(`[Node] Requesting cousins (depth=${this.myDepth})`);
 
         const reqCousins = createReqCousinsMessage(this.gameId, this.peer.id, this.myDepth, 2);
-        this.parent.send(reqCousins);
+        this.connManager.parent.send(reqCousins);
     }
 
     private connectToCousin(cousinId: string) {
@@ -1124,7 +1035,7 @@ export class Node {
 
         conn.on('open', () => {
             this.log(`[Node] Cousin connection established with ${cousinId}`);
-            this.cousins.set(cousinId, conn);
+            this.connManager.addCousin(conn);
             this.emitState();
         });
 
@@ -1135,48 +1046,41 @@ export class Node {
 
         conn.on('close', () => {
             this.log(`[Node] Cousin connection closed: ${cousinId}`);
-            this.cousins.delete(cousinId);
+            this.connManager.removeConnection(cousinId);
             this.emitState();
         });
 
         conn.on('error', (err) => {
             this.log(`[Node] Cousin connection error with ${cousinId}: ${err}`);
-            this.cousins.delete(cousinId);
+            this.connManager.removeConnection(cousinId);
         });
     }
 
     private startStallDetection() {
         if (this.stallDetectionInterval) return;
         this.stallDetectionInterval = setInterval(() => {
-            if (this.state === NodeState.REBINDING || (this as any).state === 'REBINDING') {
-                if (!this.isAttached) {
-                    this.state = NodeState.WAITING_FOR_HOST;
+            if (this.stateManager.state === NodeState.REBINDING) {
+                if (!this.stateManager.isAttached) {
+                    this.stateManager.transitionTo(NodeState.WAITING_FOR_HOST);
                     this.emitState();
                 }
             }
 
-            if (!this.isAttached) return;
+            if (!this.stateManager.isAttached) return;
 
-            const timeSinceRain = Date.now() - this.lastParentRainTime;
-
-            // 6.2 Local Detection Rule: SUSPECT_UPSTREAM after 3 seconds
-            if (timeSinceRain > 3000 && this.state === NodeState.NORMAL) {
-                this.log(`[Node] Upstream stall detected (3s). Transitioning to SUSPECT_UPSTREAM`);
-                this.state = NodeState.SUSPECT_UPSTREAM;
-                this.emitState();
-            }
+            // Delegate detection logic to StateManager
+            this.stateManager.checkStall();
 
             // 6.3 Patch Mode (Cousin Pull)
-            if (this.state === NodeState.SUSPECT_UPSTREAM || this.state === NodeState.PATCHING) {
+            if (this.stateManager.state === NodeState.SUSPECT_UPSTREAM || this.stateManager.state === NodeState.PATCHING) {
                 const now = Date.now();
 
                 // Rate limit REQ_STATE
                 let limit = 2000; // default 2s
 
-                if (this.state === NodeState.SUSPECT_UPSTREAM) {
+                if (this.stateManager.state === NodeState.SUSPECT_UPSTREAM) {
                     // Transition to PATCHING immediately
-                    this.state = NodeState.PATCHING;
-                    this.patchStartTime = now;
+                    this.stateManager.transitionTo(NodeState.PATCHING);
                     this.reqStateCount = 0;
                     this.rebindJitter = Math.random() * 10000; // 0-10s jitter to avoid rebind storms
                     limit = 0; // Send first one immediately
@@ -1200,11 +1104,11 @@ export class Node {
                 }
 
                 // 6.4 Escalation: Rebind after 60-70 seconds (with jitter to avoid storms)
-                const patchDuration = now - (this.patchStartTime || now);
+                const patchDuration = now - (this.stateManager.patchStartTime || now);
                 const rebindThreshold = 60000 + this.rebindJitter; // 60s + 0-10s jitter
-                if (this.patchStartTime !== 0 && patchDuration > rebindThreshold) {
+                if (this.stateManager.patchStartTime !== 0 && patchDuration > rebindThreshold) {
                     this.log(`[Node] Patch mode persisted > ${Math.floor(rebindThreshold / 1000)}s. Escalating to REBINDING`);
-                    this.state = NodeState.REBINDING;
+                    this.stateManager.transitionTo(NodeState.REBINDING);
                     this.emitState();
                     this.requestRebind('UPSTREAM_STALL');
                 }
@@ -1221,11 +1125,11 @@ export class Node {
     }
 
     private sendReqStateToCousins() {
-        if (this.cousins.size > 0) {
-            const cousinIds = Array.from(this.cousins.keys());
+        if (this.connManager.cousins.size > 0) {
+            const cousinIds = Array.from(this.connManager.cousins.keys());
             // Randomly pick a cousin
             const targetId = cousinIds[Math.floor(Math.random() * cousinIds.length)];
-            const cousinConn = this.cousins.get(targetId);
+            const cousinConn = this.connManager.cousins.get(targetId);
 
             if (cousinConn && cousinConn.open) {
                 this.log(`[Node] Requesting state from cousin ${targetId}`);
@@ -1233,7 +1137,7 @@ export class Node {
                     this.gameId,
                     this.peer.id,
                     targetId,
-                    this.rainSeq,
+                    this.stateManager.rainSeq,
                     this.lastGameSeq
                 );
                 cousinConn.send(reqState);
@@ -1249,7 +1153,7 @@ export class Node {
                     this.gameId,
                     this.peer.id,
                     'HOST',
-                    this.rainSeq,
+                    this.stateManager.rainSeq,
                     this.lastGameSeq
                 );
                 this.sendToHost(reqStateHost);
@@ -1261,12 +1165,12 @@ export class Node {
     }
 
     private requestRebind(reason: string) {
-        if (!this.parent || !this.parent.open) return;
+        if (!this.connManager.parent || !this.connManager.parent.open) return;
 
         // Calculate total subtree size (children + descendants)
         let totalDescendants = 0;
         this.childDescendants.forEach(list => totalDescendants += list.length);
-        const totalSubtree = 1 + this.children.size + totalDescendants;
+        const totalSubtree = 1 + this.connManager.children.size + totalDescendants;
 
         const rebindReq: ProtocolMessage = {
             t: 'REBIND_REQUEST',
@@ -1275,7 +1179,7 @@ export class Node {
             src: this.peer.id,
             msgId: uuidv4(),
             dest: 'HOST',
-            lastRainSeq: this.rainSeq,
+            lastRainSeq: this.stateManager.rainSeq,
             lastGameSeq: this.lastGameSeq,
             subtreeCount: totalSubtree,
             reason: reason,
@@ -1328,12 +1232,12 @@ export class Node {
                 role: 'NODE',
                 peerId: this.peer.id,
                 peerOpen: this.peer.open,
-                parentId: this.parent?.peer || null,
-                children: Array.from(this.children.keys()),
-                rainSeq: this.rainSeq,
-                isAttached: this.isAttached,
+                parentId: this.connManager.parent?.peer || null,
+                children: Array.from(this.connManager.children.keys()),
+                rainSeq: this.stateManager.rainSeq,
+                isAttached: this.stateManager.isAttached,
                 depth: this.myDepth,
-                state: this.state
+                state: this.stateManager.state
             });
         }
     }

@@ -18,20 +18,12 @@ import {
     GameEventCache,
     PendingAckTracker,
     shuffleArray,
-    weightedShuffle,
     createAckMessage,
     createPongMessage,
     createStateMessage,
     createGameEvent
 } from './utils/index.js';
-
-interface TopologyNode {
-    nextHop: string; // The L1 child that leads to this node
-    depth: number;
-    lastSeen: number;
-    freeSlots: number;
-    state?: string;
-}
+import { TopologyManager, TopologyNode } from './host/TopologyManager.js';
 
 export class Host {
     private peer: Peer;
@@ -43,8 +35,8 @@ export class Host {
     private children: Map<string, DataConnection> = new Map();
     private rainInterval: NodeJS.Timeout | null = null;
 
-    // Virtual Tree / Topology Map
-    private topology: Map<string, TopologyNode> = new Map();
+    // Topology Manager
+    private topologyManager: TopologyManager;
 
     // Utility classes
     private dedupCache: DeduplicationCache;
@@ -65,6 +57,9 @@ export class Host {
         this.rateLimiter = new RateLimiter(5, 10000, 30000);
         this.gameEventCache = new GameEventCache(100);
         this.ackTracker = new PendingAckTracker(10000);
+
+        // Initialize Topology Manager
+        this.topologyManager = new TopologyManager(this.children);
 
         this.peer.on('open', (id) => {
             console.log('Host Open:', id);
@@ -115,17 +110,9 @@ export class Host {
         conn.on('close', () => {
             console.log(`[Host] Connection closed: ${conn.peer}`);
             this.children.delete(conn.peer);
-            this.removeFromTopology(conn.peer);
+            this.topologyManager.removeNodesVia(conn.peer);
             this.emitState();
         });
-    }
-
-    private removeFromTopology(l1PeerId: string) {
-        for (const [id, node] of this.topology.entries()) {
-            if (node.nextHop === l1PeerId) {
-                this.topology.delete(id);
-            }
-        }
     }
 
     private handleMessage(conn: DataConnection, msg: ProtocolMessage) {
@@ -205,7 +192,7 @@ export class Host {
             case 'REBIND_REQUEST':
                 console.log(`[Host] REBIND_REQUEST from ${msg.src} (reason: ${msg.reason})`);
                 // Respond with best parent candidates based on topology
-                const rebindCandidates = this.getSmartSeeds().slice(0, 3);
+                const rebindCandidates = this.topologyManager.getSmartSeeds().slice(0, 3);
 
                 const rebindAssign: RebindAssign = {
                     t: 'REBIND_ASSIGN',
@@ -230,7 +217,7 @@ export class Host {
                 console.log(`[Host] Accepted join from ${conn.peer}`);
 
                 const hasSpace = this.children.size < 5;
-                const seeds = this.getSmartSeeds();
+                const seeds = this.topologyManager.getSmartSeeds();
 
                 const accept: JoinAccept = {
                     t: 'JOIN_ACCEPT',
@@ -257,7 +244,7 @@ export class Host {
                     // Optimized: Keep connection and promote to L1 Child immediately
                     console.log(`[Host] Promoting ${conn.peer} to L1 child`);
                     this.children.set(conn.peer, conn);
-                    this.topology.set(conn.peer, { nextHop: conn.peer, depth: 1, lastSeen: Date.now(), freeSlots: 3, state: 'OK' });
+                    this.topologyManager.updateNode(conn.peer, { nextHop: conn.peer, depth: 1, lastSeen: Date.now(), freeSlots: 3, state: 'OK' });
                     this.emitState();
                 } else {
                     // Standard spec flow: Host gave us seeds and will close connection.
@@ -276,7 +263,7 @@ export class Host {
                         src: this.peer.id,
                         msgId: uuidv4(),
                         reason: 'FULL',
-                        redirect: this.getSmartSeeds(),
+                        redirect: this.topologyManager.getSmartSeeds(),
                         depthHint: 1,
                         path: [this.peer.id]
                     };
@@ -287,7 +274,7 @@ export class Host {
                     }
                 } else {
                     this.children.set(conn.peer, conn);
-                    this.topology.set(conn.peer, { nextHop: conn.peer, depth: 1, lastSeen: Date.now(), freeSlots: 3, state: 'OK' });
+                    this.topologyManager.updateNode(conn.peer, { nextHop: conn.peer, depth: 1, lastSeen: Date.now(), freeSlots: 3, state: 'OK' });
                     this.emitState();
                     const accept: AttachAccept = {
                         t: 'ATTACH_ACCEPT',
@@ -340,7 +327,7 @@ export class Host {
         const nextHop = conn.peer;
 
         // Update Child itself (Depth 1)
-        this.topology.set(nextHop, {
+        this.topologyManager.updateNode(nextHop, {
             nextHop: nextHop,
             depth: 1,
             lastSeen: Date.now(),
@@ -350,7 +337,7 @@ export class Host {
 
         if (msg.descendants && msg.descendants.length > 0) {
             msg.descendants.forEach(d => {
-                this.topology.set(d.id, {
+                this.topologyManager.updateNode(d.id, {
                     nextHop: nextHop,
                     depth: 1 + d.hops,
                     lastSeen: Date.now(),
@@ -381,7 +368,7 @@ export class Host {
         }
 
         // Deep target case - compute full route path
-        const routeInfo = this.topology.get(targetId);
+        const routeInfo = this.topologyManager.get(targetId);
         if (routeInfo) {
             const conn = this.children.get(routeInfo.nextHop);
             if (conn && conn.open) {
@@ -393,7 +380,7 @@ export class Host {
                 return;
             } else {
                 console.warn(`[Host] NextHop ${routeInfo.nextHop} dead for target ${targetId}`);
-                this.topology.delete(targetId);
+                this.topologyManager.removeNode(targetId);
             }
         } else {
             console.warn(`[Host] No route to ${targetId}. Dropping message ${msg.t}`);
@@ -405,40 +392,12 @@ export class Host {
      * This is needed for multi-hop forwarding
      */
     private computeRoutePath(targetId: string): PeerId[] {
-        const routeInfo = this.topology.get(targetId);
+        const routeInfo = this.topologyManager.get(targetId);
         if (!routeInfo) return [];
 
         // For now, we can only provide [host, nextHop, ...] since we don't have full tree structure
         // Nodes will need to continue forwarding based on their own descendant maps
         return [this.peer.id, routeInfo.nextHop];
-    }
-
-    private getSmartSeeds(): string[] {
-        // Return peers with > 0 free slots provided their depth isn't too high
-        // Sort by: 1) depth (shallow first), 2) capacity (more slots first)
-        const candidates = Array.from(this.topology.entries())
-            .filter(([id, node]) => node.freeSlots > 0 && node.depth < 4)
-            .sort((a, b) => {
-                // Primary: shallowest depth first
-                if (a[1].depth !== b[1].depth) {
-                    return a[1].depth - b[1].depth;
-                }
-                // Secondary: bias toward higher capacity
-                return b[1].freeSlots - a[1].freeSlots;
-            })
-            .map(entry => entry[0]);
-
-        // Randomize the list to avoid hotspots, but keep shallow/high-capacity nodes more likely
-        const shuffled = weightedShuffle(candidates);
-
-        // Fallback to direct children if no smart candidates found
-        if (shuffled.length < 5) {
-            const childKeys = Array.from(this.children.keys()).filter(id => !shuffled.includes(id));
-            const extra = shuffleArray(childKeys);
-            shuffled.push(...extra);
-        }
-
-        return shuffled.slice(0, 10); // Return up to 10
     }
 
     private startRain() {
@@ -472,22 +431,6 @@ export class Host {
 
     /**
      * Generate QR payload / connection string for joiners (§4.1)
-     * The host renders a QR that changes over time.
-     *
-     * Required fields:
-     * - v: protocol version (1)
-     * - gameId: session id
-     * - secret: join secret
-     * - hostId: PeerJS ID of host
-     * - seeds: array of PeerJS IDs (5-10) with known capacity
-     * - qrSeq: monotonic sequence number
-     *
-     * Optional fields:
-     * - latestRainSeq: current rain sequence
-     * - latestGameSeq: current game sequence
-     * - mode: e.g., 'TREE'
-     *
-     * @returns Connection string object suitable for QR encoding
      */
     public getConnectionString(): {
         v: number;
@@ -506,7 +449,7 @@ export class Host {
             gameId: this.gameId,
             secret: this.secret,
             hostId: this.peer.id,
-            seeds: this.getSmartSeeds(),
+            seeds: this.topologyManager.getSmartSeeds(),
             qrSeq: this.qrSeq,
             latestRainSeq: this.rainSeq,
             latestGameSeq: this.gameSeq,
@@ -563,24 +506,12 @@ export class Host {
     }
     private emitState() {
         if (this.onStateChange) {
-            // Convert topology Map to array with full node info for UI
-            const topologyData: { id: string; depth: number; nextHop: string; freeSlots: number; state?: string }[] = [];
-            this.topology.forEach((node, id) => {
-                topologyData.push({
-                    id,
-                    depth: node.depth,
-                    nextHop: node.nextHop,
-                    freeSlots: node.freeSlots,
-                    state: node.state
-                });
-            });
-
             this.onStateChange({
                 role: 'HOST',
                 peerId: this.peer.id,
                 children: Array.from(this.children.keys()),
                 rainSeq: this.rainSeq,
-                topology: topologyData // Full topology for visualization
+                topology: this.topologyManager.getAllData()
             });
         }
     }

@@ -83,8 +83,8 @@ describe('Audit Fixes Verification', () => {
         (host as any).children.set('nodeA', hostConn);
         (host as any).topology.set('nodeA', { nextHop: 'nodeA', depth: 1, lastSeen: Date.now(), freeSlots: 3, state: 'OK' });
 
-        // Host MAX_CACHE_SIZE is 20. Push 25 events so the oldest 5 drop.
-        for (let i = 1; i <= 25; i++) {
+        // Host MAX_CACHE_SIZE is 100. Push 110 events so the oldest 10 drop.
+        for (let i = 1; i <= 110; i++) {
             host.broadcastGameEvent(`EVT${i}`, { i });
         }
 
@@ -107,10 +107,10 @@ describe('Audit Fixes Verification', () => {
 
         // The response should admit truncation and expose the minimum available seq.
         expect(response.truncated).toBe(true);
-        expect(response.minGameSeqAvailable).toBe(6);
+        expect(response.minGameSeqAvailable).toBe(11); // First 10 dropped, cache starts at seq 11
         expect(Array.isArray(response.events)).toBe(true);
-        expect(response.events[0].seq).toBe(6);
-        expect(response.events[response.events.length - 1].seq).toBe(25);
+        expect(response.events[0].seq).toBe(11);
+        expect(response.events[response.events.length - 1].seq).toBe(110);
     });
 
     it('Gap 2: Incoming cousin connection is registered', async () => {
@@ -257,6 +257,7 @@ describe('Audit Fixes Verification', () => {
         const newConn = new FakeDataConnection('newJoiner');
         // (newConn as any).peer = 'newJoiner';
         (newConn as any).metadata = { gameId: 'game', secret: 'secret' };
+        newConn.open = true; // Must be open for Host to send ATTACH_REJECT
 
         // Trigger ATTACH_REQUEST via handleMessage since direct event listener might be hard to reach
         // Actually handleConnection binds it. Let's call callback directly if exposed?

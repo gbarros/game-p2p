@@ -46,11 +46,17 @@ export class Host {
 
     // Game event cache for STATE responses (fallback for L1 nodes or when cousins unavailable)
     private gameEventCache: Array<{ seq: number; event: { type: string; data: unknown } }> = [];
-    private readonly MAX_CACHE_SIZE = 20;
+    private readonly MAX_CACHE_SIZE = 100; // Increased from 20 for longer game sessions
 
     // Deduplication
     private recentMsgIds: Set<string> = new Set();
     private readonly MAX_MSG_ID_CACHE = 100;
+
+    // Rate limiting for incoming connections
+    private connectionAttempts: Map<string, number[]> = new Map(); // peerId -> timestamps
+    private readonly CONNECTION_RATE_LIMIT = 5; // Max 5 connections per 10 seconds per peer
+    private readonly CONNECTION_RATE_WINDOW = 10000; // 10 seconds
+    private rateLimitCleanupInterval: NodeJS.Timeout | null = null;
 
     constructor(gameId: string, secret: string, peer: Peer) {
         this.gameId = gameId;
@@ -61,6 +67,7 @@ export class Host {
             console.log('Host Open:', id);
             this.startRain();
             this.emitState();
+            this.startRateLimitCleanup();
         });
 
         this.peer.on('error', (err) => {
@@ -73,6 +80,21 @@ export class Host {
     }
 
     private handleConnection(conn: DataConnection) {
+        // Rate limit check
+        const now = Date.now();
+        const attempts = this.connectionAttempts.get(conn.peer) || [];
+        const recentAttempts = attempts.filter(t => now - t < this.CONNECTION_RATE_WINDOW);
+
+        if (recentAttempts.length >= this.CONNECTION_RATE_LIMIT) {
+            console.warn(`[Host] Rate limit exceeded for ${conn.peer} (${recentAttempts.length} attempts in ${this.CONNECTION_RATE_WINDOW}ms), rejecting`);
+            conn.close();
+            return;
+        }
+
+        // Track this attempt
+        recentAttempts.push(now);
+        this.connectionAttempts.set(conn.peer, recentAttempts);
+
         const meta = conn.metadata;
         console.log('New connection:', conn.peer, meta);
         if (!meta || meta.gameId !== this.gameId || meta.secret !== this.secret) {
@@ -124,10 +146,15 @@ export class Host {
         }
         this.recentMsgIds.add(msg.msgId);
         if (this.recentMsgIds.size > this.MAX_MSG_ID_CACHE) {
-            // Simple FIFO cleanup
+            // Batch cleanup: remove oldest 20% to prevent unbounded growth
+            const toRemove = Math.floor(this.MAX_MSG_ID_CACHE * 0.2);
             const iterator = this.recentMsgIds.values();
-            const first = iterator.next().value;
-            if (first !== undefined) this.recentMsgIds.delete(first);
+            for (let i = 0; i < toRemove; i++) {
+                const item = iterator.next().value;
+                if (item !== undefined) {
+                    this.recentMsgIds.delete(item);
+                }
+            }
         }
 
         switch (msg.t) {
@@ -163,6 +190,7 @@ export class Host {
                 console.log(`[Host] GAME_CMD from ${msg.src}: ${msg.cmd?.type}`);
                 // Send ACK if requested
                 if (msg.ack) {
+                    const reversePath = msg.path ? [...msg.path].reverse() : [msg.src];
                     this.routeMessage(msg.src, {
                         t: 'ACK',
                         v: 1,
@@ -171,7 +199,8 @@ export class Host {
                         msgId: uuidv4(),
                         replyTo: msg.msgId,
                         dest: msg.src,
-                        path: msg.path || []
+                        path: [this.peer.id],
+                        route: [this.peer.id, ...reversePath]
                     });
                 }
                 // Notify callback if registered (treat GAME_CMD as the new upstream message type)
@@ -184,6 +213,7 @@ export class Host {
                 // GAME_EVENT should only be host-originated now, but handle legacy incoming if any
                 console.log(`[Host] GAME_EVENT from ${msg.src}: ${msg.event?.type}`);
                 if (msg.ack) {
+                    const reversePath = msg.path ? [...msg.path].reverse() : [msg.src];
                     this.routeMessage(msg.src, {
                         t: 'ACK',
                         v: 1,
@@ -192,7 +222,8 @@ export class Host {
                         msgId: uuidv4(),
                         replyTo: msg.msgId,
                         dest: msg.src,
-                        path: msg.path || []
+                        path: [this.peer.id],
+                        route: [this.peer.id, ...reversePath]
                     });
                 }
                 if (this.onGameEventCallback && msg.event) {
@@ -266,7 +297,12 @@ export class Host {
                     gameSeq: this.gameSeq,
                     path: [this.peer.id]
                 };
-                conn.send(accept);
+
+                if (conn.open) {
+                    conn.send(accept);
+                } else {
+                    console.warn(`[Host] Connection to ${conn.peer} closed before sending JOIN_ACCEPT`);
+                }
 
                 if (hasSpace) {
                     // Optimized: Keep connection and promote to L1 Child immediately
@@ -298,7 +334,11 @@ export class Host {
                         depthHint: 1,
                         path: [this.peer.id]
                     };
-                    conn.send(reject);
+                    if (conn.open) {
+                        conn.send(reject);
+                    } else {
+                        console.warn(`[Host] Connection to ${conn.peer} closed before sending ATTACH_REJECT`);
+                    }
                 } else {
                     // Logic duplication here, but acceptable for clarity
                     this.children.set(conn.peer, conn);
@@ -318,7 +358,11 @@ export class Host {
                         childrenUsed: this.children.size,
                         path: [this.peer.id]
                     };
-                    conn.send(accept);
+                    if (conn.open) {
+                        conn.send(accept);
+                    } else {
+                        console.warn(`[Host] Connection to ${conn.peer} closed before sending ATTACH_ACCEPT`);
+                    }
                 }
                 break;
 
@@ -516,6 +560,21 @@ export class Host {
             };
             this.broadcast(rain);
         }, 1000);
+    }
+
+    private startRateLimitCleanup() {
+        // Periodic cleanup of old connection attempt timestamps
+        this.rateLimitCleanupInterval = setInterval(() => {
+            const now = Date.now();
+            this.connectionAttempts.forEach((attempts, peerId) => {
+                const recent = attempts.filter(t => now - t < this.CONNECTION_RATE_WINDOW);
+                if (recent.length === 0) {
+                    this.connectionAttempts.delete(peerId);
+                } else {
+                    this.connectionAttempts.set(peerId, recent);
+                }
+            });
+        }, 30000); // Cleanup every 30s
     }
 
     private broadcast(msg: ProtocolMessage) {

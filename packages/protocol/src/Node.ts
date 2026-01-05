@@ -65,12 +65,13 @@ export class Node {
     private cousins: Map<string, DataConnection> = new Map();
     private lastGameSeq: number = 0;
     private gameEventCache: Array<{ seq: number; event: { type: string; data: unknown } }> = [];
-    private MAX_CACHE_SIZE = 20; // Configurable cache size (default 20)
+    private MAX_CACHE_SIZE = 50; // Configurable cache size (increased from 20 for longer sessions)
     private lastParentRainTime: number = Date.now();
     private stallDetectionInterval: NodeJS.Timeout | null = null;
     private lastReqStateTime: number = 0; // Track when we last sent REQ_STATE
     private reqStateTarget: 'COUSIN' | 'HOST' | null = null; // Track where we sent REQ_STATE
     private reqStateCount: number = 0; // Track number of REQ_STATE sent for rate limiting
+    private rebindJitter: number = 0; // Random jitter (0-10s) for rebind timing to avoid storms
 
     // Join robustness
     private readonly MAX_ATTACH_ATTEMPTS = 10;
@@ -89,6 +90,12 @@ export class Node {
     private recentMsgIds: Set<string> = new Set();
     private readonly MAX_MSG_ID_CACHE = 100;
 
+    // Rate limiting for incoming connections
+    private connectionAttempts: Map<string, number[]> = new Map(); // peerId -> timestamps
+    private readonly CONNECTION_RATE_LIMIT = 5; // Max 5 connections per 10 seconds per peer
+    private readonly CONNECTION_RATE_WINDOW = 10000; // 10 seconds
+    private rateLimitCleanupInterval: NodeJS.Timeout | null = null;
+
     constructor(gameId: string, secret: string, peer: Peer, logger?: (msg: string) => void) {
         this.gameId = gameId;
         this.secret = secret;
@@ -98,6 +105,7 @@ export class Node {
         this.peer.on('open', (id) => {
             this.log(`[Node] Peer Open: ${id}`);
             this.emitState();
+            this.startRateLimitCleanup();
         });
 
         this.peer.on('error', (err) => {
@@ -139,12 +147,12 @@ export class Node {
 
     /**
      * Configure the game event cache size
-     * @param size Number of events to cache (default: 20)
+     * @param size Number of events to cache (default: 50)
      */
     public setGameEventCacheSize(size: number) {
         if (size < 0) {
-            this.log('[Node] Warning: Cache size must be >= 0, using default of 20');
-            this.MAX_CACHE_SIZE = 20;
+            this.log('[Node] Warning: Cache size must be >= 0, using default of 50');
+            this.MAX_CACHE_SIZE = 50;
             return;
         }
         this.MAX_CACHE_SIZE = size;
@@ -157,13 +165,45 @@ export class Node {
 
     public close() {
         this.log('[Node] Closing (Simulated Kill)...');
+
+        // Clear all pending ACKs and reject promises
+        this.pendingAcks.forEach((pending) => {
+            clearTimeout(pending.timeout);
+            pending.reject(new Error('Node closing'));
+        });
+        this.pendingAcks.clear();
+
+        // Clear pending pings
+        this.pendingPings.clear();
+
         // Stop any intervals
         if (this.subtreeInterval) clearInterval(this.subtreeInterval);
         if (this.stallDetectionInterval) clearInterval(this.stallDetectionInterval);
+        if (this.attachRetryTimer) clearTimeout(this.attachRetryTimer);
+        if (this.rateLimitCleanupInterval) clearInterval(this.rateLimitCleanupInterval);
+
         this.subtreeInterval = null;
         this.stallDetectionInterval = null;
+        this.attachRetryTimer = null;
+        this.rateLimitCleanupInterval = null;
+
         // Close peer connection
         this.peer.destroy();
+    }
+
+    private startRateLimitCleanup() {
+        // Periodic cleanup of old connection attempt timestamps
+        this.rateLimitCleanupInterval = setInterval(() => {
+            const now = Date.now();
+            this.connectionAttempts.forEach((attempts, peerId) => {
+                const recent = attempts.filter(t => now - t < this.CONNECTION_RATE_WINDOW);
+                if (recent.length === 0) {
+                    this.connectionAttempts.delete(peerId);
+                } else {
+                    this.connectionAttempts.set(peerId, recent);
+                }
+            });
+        }, 30000); // Cleanup every 30s
     }
 
     private log(msg: string, ...args: any[]) {
@@ -462,10 +502,15 @@ export class Node {
         }
         this.recentMsgIds.add(msg.msgId);
         if (this.recentMsgIds.size > this.MAX_MSG_ID_CACHE) {
-            // Simple FIFO cleanup
+            // Batch cleanup: remove oldest 20% to prevent unbounded growth
+            const toRemove = Math.floor(this.MAX_MSG_ID_CACHE * 0.2);
             const iterator = this.recentMsgIds.values();
-            const first = iterator.next().value;
-            if (first !== undefined) this.recentMsgIds.delete(first);
+            for (let i = 0; i < toRemove; i++) {
+                const item = iterator.next().value;
+                if (item !== undefined) {
+                    this.recentMsgIds.delete(item);
+                }
+            }
         }
         const isFromParent = this.parent && conn.peer === this.parent.peer;
         const isFromChild = this.children.has(conn.peer);
@@ -833,6 +878,7 @@ export class Node {
 
                     this.log(`[Node] Found ${finalCandidates.length} local cousin candidates for ${msg.src}`);
 
+                    const reversePath = [...(msg.path || [])].reverse();
                     const cousinsMsg: CousinsMessage = {
                         t: 'COUSINS',
                         v: 1,
@@ -842,16 +888,12 @@ export class Node {
                         replyTo: msg.msgId,
                         dest: msg.src,
                         candidates: finalCandidates,
-                        path: [this.peer.id]
+                        path: [this.peer.id],
+                        route: [this.peer.id, ...reversePath] // Include reverse-path routing
                     };
 
-                    // Route back to requester using reverse path or routing
-                    if (isFromChild) {
-                        conn.send(cousinsMsg);
-                    } else {
-                        // Forward back using routing
-                        this.routeMessageToTarget(msg.src, cousinsMsg);
-                    }
+                    // Route back to requester using reverse path
+                    this.routeReply(cousinsMsg, conn);
                 } else {
                     // No local candidates, forward upstream if possible
                     this.log(`[Node] No local cousins found, forwarding REQ_COUSINS upstream`);
@@ -859,6 +901,7 @@ export class Node {
                         this.parent.send(msg);
                     } else {
                         // Send empty response
+                        const reversePath = [...(msg.path || [])].reverse();
                         const cousinsMsg: CousinsMessage = {
                             t: 'COUSINS',
                             v: 1,
@@ -868,9 +911,10 @@ export class Node {
                             replyTo: msg.msgId,
                             dest: msg.src,
                             candidates: [],
-                            path: [this.peer.id]
+                            path: [this.peer.id],
+                            route: [this.peer.id, ...reversePath] // Include reverse-path routing
                         };
-                        conn.send(cousinsMsg);
+                        this.routeReply(cousinsMsg, conn);
                     }
                 }
                 break;
@@ -961,6 +1005,21 @@ export class Node {
     // --- Parent Logic ---
 
     private handleIncomingConnection(conn: DataConnection) {
+        // Rate limit check
+        const now = Date.now();
+        const attempts = this.connectionAttempts.get(conn.peer) || [];
+        const recentAttempts = attempts.filter(t => now - t < this.CONNECTION_RATE_WINDOW);
+
+        if (recentAttempts.length >= this.CONNECTION_RATE_LIMIT) {
+            this.log(`[Node] Rate limit exceeded for ${conn.peer} (${recentAttempts.length} attempts in ${this.CONNECTION_RATE_WINDOW}ms), rejecting`);
+            conn.close();
+            return;
+        }
+
+        // Track this attempt
+        recentAttempts.push(now);
+        this.connectionAttempts.set(conn.peer, recentAttempts);
+
         const meta = conn.metadata;
         if (!meta || meta.gameId !== this.gameId || meta.secret !== this.secret) {
             conn.close();
@@ -1266,6 +1325,7 @@ export class Node {
                     this.state = NodeState.PATCHING;
                     this.patchStartTime = now;
                     this.reqStateCount = 0;
+                    this.rebindJitter = Math.random() * 10000; // 0-10s jitter to avoid rebind storms
                     limit = 0; // Send first one immediately
                     this.log(`[Node] Entering PATCH MODE`);
                     this.emitState();
@@ -1286,10 +1346,11 @@ export class Node {
                     this.sendReqStateToCousins();
                 }
 
-                // 6.4 Escalation: Rebind after 60-120 seconds
+                // 6.4 Escalation: Rebind after 60-70 seconds (with jitter to avoid storms)
                 const patchDuration = now - (this.patchStartTime || now);
-                if (this.patchStartTime !== 0 && patchDuration > 60000) {
-                    this.log(`[Node] Patch mode persisted > 60s. Escalating to REBINDING`);
+                const rebindThreshold = 60000 + this.rebindJitter; // 60s + 0-10s jitter
+                if (this.patchStartTime !== 0 && patchDuration > rebindThreshold) {
+                    this.log(`[Node] Patch mode persisted > ${Math.floor(rebindThreshold / 1000)}s. Escalating to REBINDING`);
                     this.state = NodeState.REBINDING;
                     this.emitState();
                     this.requestRebind('UPSTREAM_STALL');

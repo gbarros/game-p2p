@@ -1368,8 +1368,8 @@ describe('Rebind timing (§6.4)', () => {
         let rebinds = parentConn.sent.filter((msg) => (msg as ProtocolMessage).t === 'REBIND_REQUEST');
         expect(rebinds.length).toBe(0);
 
-        // At 60 seconds, SHOULD have rebind
-        await vi.advanceTimersByTimeAsync(10000);
+        // At 70 seconds (60s + max 10s jitter), SHOULD have rebind
+        await vi.advanceTimersByTimeAsync(20000); // Advance to 70 total
         rebinds = parentConn.sent.filter((msg) => (msg as ProtocolMessage).t === 'REBIND_REQUEST');
         expect(rebinds.length).toBeGreaterThan(0);
     });
@@ -1386,5 +1386,270 @@ describe('Rebind timing (§6.4)', () => {
         await vi.advanceTimersByTimeAsync(30000);
 
         expect((node as any).state).not.toBe('REBINDING');
+    });
+});
+
+describe('Phase 4: Advanced Reliability Tests', () => {
+    it('Test A: L1 node recovers state from host when no cousins available', async () => {
+        const host = new Host('game', 'secret', new FakePeer('host') as any);
+        const node = new Node('game', 'secret', new FakePeer('node1') as any);
+
+        // Bootstrap node to host
+        node.bootstrap(host.getPeerId());
+        await settleTimers(20);
+
+        // Add some game events to host cache
+        host.broadcastGameEvent('EVT1', { data: 1 });
+        host.broadcastGameEvent('EVT2', { data: 2 });
+        await settleTimers(5);
+
+        // Manually set node as L1 child (attached but no cousins)
+        (node as any).isAttached = true;
+        (node as any).parent = (node as any).hostConnection;
+        (node as any).myDepth = 1;
+        (node as any).lastParentRainTime = Date.now() - 5000; // Stale parent
+
+        // Trigger stall detection → PATCHING → REQ_STATE to host
+        (node as any).state = 'SUSPECT_UPSTREAM';
+        await vi.advanceTimersByTimeAsync(1000);
+
+        // Verify node entered PATCHING
+        expect((node as any).state).toBe('PATCHING');
+
+        // Allow time for REQ_STATE and STATE response
+        await settleTimers(10);
+
+        // Verify node received state (would return to NORMAL or have updated gameSeq)
+        expect((node as any).lastGameSeq).toBeGreaterThan(0);
+    });
+
+    it('Test B: incoming cousin connections enable bidirectional state requests', async () => {
+        const nodeA = new Node('game', 'secret', new FakePeer('nodeA') as any);
+        const nodeB = new Node('game', 'secret', new FakePeer('nodeB') as any);
+
+        // Add some events to nodeB's cache
+        (nodeB as any).gameEventCache = [
+            { seq: 1, event: { type: 'EVT1', data: { a: 1 } } },
+            { seq: 2, event: { type: 'EVT2', data: { a: 2 } } }
+        ];
+        (nodeB as any).lastGameSeq = 2;
+        (nodeB as any).rainSeq = 10;
+
+        // Simulate nodeA connecting to nodeB as cousin
+        const connAtoB = new FakeDataConnection('nodeB', { gameId: 'game', secret: 'secret', role: 'COUSIN' });
+        const connBtoA = new FakeDataConnection('nodeA', { gameId: 'game', secret: 'secret', role: 'COUSIN' });
+        connAtoB.open = true;
+        connBtoA.open = true;
+        connAtoB._other = connBtoA;
+        connBtoA._other = connAtoB;
+
+        // NodeB receives incoming cousin connection from nodeA
+        (nodeB as any).handleIncomingConnection(connBtoA);
+        await settleTimers(2);
+
+        // Verify nodeB registered the cousin
+        expect((nodeB as any).cousins.has('nodeA')).toBe(true);
+
+        // NodeA sends REQ_STATE to nodeB
+        const reqState: ProtocolMessage = {
+            t: 'REQ_STATE',
+            v: 1,
+            gameId: 'game',
+            src: 'nodeA',
+            msgId: 'req-1',
+            dest: 'nodeB',
+            fromRainSeq: 0,
+            fromGameSeq: 0,
+            path: ['nodeA']
+        };
+
+        connBtoA.emit('data', reqState);
+        await settleTimers(5);
+
+        // Verify nodeB sent STATE response back
+        const stateMsg = connBtoA.sent.find(m => (m as any).t === 'STATE');
+        expect(stateMsg).toBeDefined();
+        expect((stateMsg as any).events).toHaveLength(2);
+    });
+
+    it('Test C: STATE events preserve sequence numbers under cache truncation', async () => {
+        const host = new Host('game', 'secret', new FakePeer('host') as any);
+        const node = new Node('game', 'secret', new FakePeer('node') as any);
+
+        // Generate 110 events to trigger truncation (cache size is 100)
+        for (let i = 1; i <= 110; i++) {
+            host.broadcastGameEvent(`EVT${i}`, { seq: i });
+        }
+        await settleTimers(5);
+
+        // Verify host cache is truncated
+        expect((host as any).gameEventCache.length).toBeLessThanOrEqual(100);
+
+        // Request state from seq 0 (which is now truncated)
+        const hostConn = new FakeDataConnection('node');
+        hostConn.open = true;
+        (host as any).children.set('node', hostConn);
+
+        const reqState: ProtocolMessage = {
+            t: 'REQ_STATE',
+            v: 1,
+            gameId: 'game',
+            src: 'node',
+            msgId: 'm1',
+            dest: 'HOST',
+            fromRainSeq: 0,
+            fromGameSeq: 0,
+            path: ['node']
+        };
+
+        (host as any).handleMessage(hostConn, reqState);
+        await settleTimers(2);
+
+        const stateMsg = hostConn.sent.find(m => (m as any).t === 'STATE') as any;
+        expect(stateMsg).toBeDefined();
+        expect(stateMsg.truncated).toBe(true);
+        expect(stateMsg.minGameSeqAvailable).toBeGreaterThan(0);
+
+        // Verify events include explicit sequence numbers
+        expect(stateMsg.events.length).toBeGreaterThan(0);
+        expect(stateMsg.events[0]).toHaveProperty('seq');
+        expect(stateMsg.events[0]).toHaveProperty('event');
+    });
+
+    it('Test D: gracefully handles connection close during message send', async () => {
+        const node = new Node('game', 'secret', new FakePeer('node') as any);
+        const parentConn = new FakeDataConnection('parent');
+
+        (node as any).parent = parentConn;
+        (node as any).isAttached = true;
+        parentConn.open = true;
+
+        // Send message with ACK using sendGameEvent (which returns a promise when ack=true)
+        const promise = node.sendGameEvent('TEST', { data: 'test' }, true) as Promise<boolean>;
+
+        // Close the connection immediately
+        parentConn.open = false;
+        parentConn.close();
+
+        // Close the node which should reject pending promises
+        node.close();
+
+        // Verify promise was rejected
+        await expect(promise).rejects.toThrow('Node closing');
+    });
+
+    it('Test E: recentMsgIds stays under MAX_MSG_ID_CACHE limit', async () => {
+        const node = new Node('game', 'secret', new FakePeer('node') as any);
+        const conn = new FakeDataConnection('sender');
+        conn.open = true;
+
+        // Send 200 unique messages
+        for (let i = 0; i < 200; i++) {
+            const msg: ProtocolMessage = {
+                t: 'PING',
+                v: 1,
+                gameId: 'game',
+                src: 'sender',
+                msgId: `msg-${i}`,
+                dest: 'node',
+                path: ['sender']
+            };
+            (node as any).handleMessage(conn, msg);
+        }
+
+        await settleTimers(5);
+
+        // Verify size never exceeds MAX_MSG_ID_CACHE (100)
+        expect((node as any).recentMsgIds.size).toBeLessThanOrEqual(100);
+    });
+
+    it('Test F: multiple nodes rebinding simultaneously spread requests with jitter', async () => {
+        const host = new Host('game', 'secret', new FakePeer('host') as any);
+        const nodes: Node[] = [];
+        const rebindTimes: number[] = [];
+
+        // Create 20 nodes
+        for (let i = 0; i < 20; i++) {
+            const node = new Node('game', 'secret', new FakePeer(`node${i}`) as any);
+            nodes.push(node);
+
+            // Simulate all nodes entering PATCHING at same time
+            (node as any).state = 'SUSPECT_UPSTREAM';
+            (node as any).isAttached = true;
+            (node as any).parent = new FakeDataConnection('parent');
+            (node as any).parent.open = true;
+        }
+
+        // Advance time by 1s to trigger PATCHING state
+        await vi.advanceTimersByTimeAsync(1000);
+
+        // All nodes should be in PATCHING now with different jitter values
+        const jitterValues = nodes.map(n => (n as any).rebindJitter);
+
+        // Verify jitter values are diverse (not all the same)
+        const uniqueJitters = new Set(jitterValues);
+        expect(uniqueJitters.size).toBeGreaterThan(10); // At least 10 different values
+
+        // Verify jitter is in range [0, 10000ms]
+        jitterValues.forEach(jitter => {
+            expect(jitter).toBeGreaterThanOrEqual(0);
+            expect(jitter).toBeLessThanOrEqual(10000);
+        });
+    });
+
+    it('Test G: JOIN_ACCEPT seeds sorted by depth and capacity when Host full', async () => {
+        const host = new Host('game', 'secret', new FakePeer('host') as any);
+
+        // Fill host with 5 children
+        for (let i = 1; i <= 5; i++) {
+            const conn = new FakeDataConnection(`child${i}`);
+            conn.open = true;
+            (host as any).children.set(`child${i}`, conn);
+
+            // Set varying capacities and depths
+            const freeSlots = i === 2 ? 10 : i === 4 ? 5 : 0;
+            (host as any).topology.set(`child${i}`, {
+                nextHop: `child${i}`,
+                depth: 1,
+                lastSeen: Date.now(),
+                freeSlots: freeSlots,
+                state: 'OK'
+            });
+        }
+
+        // Trigger JOIN when host is full
+        const newConn = new FakeDataConnection('newJoiner');
+        newConn.open = true;
+        (newConn as any).metadata = { gameId: 'game', secret: 'secret' };
+
+        const joinReq: ProtocolMessage = {
+            t: 'JOIN_REQUEST',
+            v: 1,
+            gameId: 'game',
+            src: 'newJoiner',
+            msgId: 'join-1',
+            dest: 'HOST',
+            secret: 'secret',
+            path: ['newJoiner']
+        };
+
+        (host as any).handleMessage(newConn, joinReq);
+        await settleTimers(2);
+
+        // Host sends JOIN_ACCEPT with keepAlive=false and smart seeds when full
+        const accept = newConn.sent.find(m => (m as any).t === 'JOIN_ACCEPT') as any;
+        expect(accept).toBeDefined();
+        expect(accept.keepAlive).toBe(false); // Host is full
+        expect(Array.isArray(accept.seeds)).toBe(true);
+
+        // Verify seeds are sorted: child2 (10 slots) and child4 (5 slots) should be first
+        // Since they have same depth (1), they're sorted by capacity: child2 before child4
+        expect(accept.seeds).toContain('child2');
+        expect(accept.seeds).toContain('child4');
+
+        // child2 should appear before child4 (higher capacity)
+        const idx2 = accept.seeds.indexOf('child2');
+        const idx4 = accept.seeds.indexOf('child4');
+        expect(idx2).toBeLessThan(idx4);
     });
 });

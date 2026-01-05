@@ -7,9 +7,7 @@ import {
     AttachAccept,
     AttachReject,
     SubtreeStatus,
-    RebindAssign,
-    ReqCousins,
-    CousinsMessage
+    RebindAssign
 } from './types.js';
 import {
     DeduplicationCache,
@@ -72,7 +70,6 @@ export class Node {
     private lastGameSeq: number = 0;
     private stallDetectionInterval: NodeJS.Timeout | null = null;
     private lastReqStateTime: number = 0; // Track when we last sent REQ_STATE
-    private reqStateTarget: 'COUSIN' | 'HOST' | null = null; // Track where we sent REQ_STATE
     private reqStateCount: number = 0; // Track number of REQ_STATE sent for rate limiting
     private rebindJitter: number = 0; // Random jitter (0-10s) for rebind timing to avoid storms
 
@@ -81,7 +78,6 @@ export class Node {
     private readonly MAX_REDIRECT_DEPTH = 5;
     private attachAttempts: number = 0;
     private redirectDepth: number = 0;
-    private lastAttachTime: number = 0;
     private attachRetryTimer: NodeJS.Timeout | null = null;
     private authAttempts: number = 0;
 
@@ -355,7 +351,6 @@ export class Node {
         }
 
         this.attachAttempts++;
-        this.lastAttachTime = Date.now();
 
         this.log(`[Node] Attempting to attach to ${targetId}...`);
         const conn = this.peer.connect(targetId, {
@@ -524,7 +519,6 @@ export class Node {
                     const updated = this.stateManager.processRain(msg.rainSeq, true);
                     if (!updated) return;
 
-                    this.reqStateTarget = null;
                     this.emitState();
 
                     const forwardedMsg = addToPath(msg, this.peer.id);
@@ -686,7 +680,6 @@ export class Node {
                     this.connManager.broadcast(rainMsg);
                 }
 
-                this.reqStateTarget = null; // Reset since we got a response
                 break;
 
             case 'REQ_COUSINS':
@@ -699,7 +692,7 @@ export class Node {
                 const requesterHops = targetDepth - this.myDepth; // How many hops down from us
 
                 // Look through other children's descendants at the same depth
-                this.connManager.children.forEach((childConn, childId) => {
+                this.connManager.children.forEach((_childConn, childId) => {
                     // Skip the requester's branch
                     if (childId === msg.src || this.descendantToNextHop.get(msg.src) === childId) {
                         return;
@@ -815,7 +808,7 @@ export class Node {
         // Rebuild descendant-to-nextHop map
         this.descendantToNextHop.clear();
 
-        this.connManager.children.forEach((conn, childId) => {
+        this.connManager.children.forEach((_conn, childId) => {
             const childCapacity = this.childCapacities.get(childId) || 0;
 
             // Direct child
@@ -912,12 +905,12 @@ export class Node {
         });
     }
 
-    private handleIncomingAttach(conn: DataConnection, msg: AttachRequest) {
+    private handleIncomingAttach(conn: DataConnection, _msg: AttachRequest) {
         if (this.connManager.children.size >= this.MAX_CHILDREN) {
             // Smart redirect: find descendants with free slots
             const candidates: string[] = [];
             // 1. Check direct children
-            this.connManager.children.forEach((childConn, childId) => {
+            this.connManager.children.forEach((_childConn, childId) => {
                 if ((this.childCapacities.get(childId) || 0) > 0) {
                     candidates.push(childId);
                 }
@@ -1142,7 +1135,6 @@ export class Node {
                 );
                 cousinConn.send(reqState);
                 this.lastReqStateTime = Date.now();
-                this.reqStateTarget = 'COUSIN';
                 this.reqStateCount++;
             }
         } else {
@@ -1158,7 +1150,6 @@ export class Node {
                 );
                 this.sendToHost(reqStateHost);
                 this.lastReqStateTime = Date.now();
-                this.reqStateTarget = 'HOST';
                 this.reqStateCount++;
             }
         }

@@ -1428,7 +1428,6 @@ describe('Phase 4: Advanced Reliability Tests', () => {
     });
 
     it('Test B: incoming cousin connections enable bidirectional state requests', async () => {
-        const nodeA = new Node('game', 'secret', new FakePeer('nodeA') as any);
         const nodeB = new Node('game', 'secret', new FakePeer('nodeB') as any);
 
         // Add some events to nodeB's cache using the proper API
@@ -1476,7 +1475,6 @@ describe('Phase 4: Advanced Reliability Tests', () => {
 
     it('Test C: STATE events preserve sequence numbers under cache truncation', async () => {
         const host = new Host('game', 'secret', new FakePeer('host') as any);
-        const node = new Node('game', 'secret', new FakePeer('node') as any);
 
         // Generate 110 events to trigger truncation (cache size is 100)
         for (let i = 1; i <= 110; i++) {
@@ -1566,9 +1564,7 @@ describe('Phase 4: Advanced Reliability Tests', () => {
     });
 
     it('Test F: multiple nodes rebinding simultaneously spread requests with jitter', async () => {
-        const host = new Host('game', 'secret', new FakePeer('host') as any);
         const nodes: Node[] = [];
-        const rebindTimes: number[] = [];
 
         // Create 20 nodes
         for (let i = 0; i < 20; i++) {

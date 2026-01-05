@@ -51,7 +51,7 @@ export class TopologyManager {
         // Return peers with > 0 free slots provided their depth isn't too high
         // Sort by: 1) depth (shallow first), 2) capacity (more slots first)
         const candidates = Array.from(this.topology.entries())
-            .filter(([id, node]) => node.freeSlots > 0 && node.depth < 4)
+            .filter(([_id, node]) => node.freeSlots > 0 && node.depth < 4)
             .sort((a, b) => {
                 // Primary: shallowest depth first
                 if (a[1].depth !== b[1].depth) {

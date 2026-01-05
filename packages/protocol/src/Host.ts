@@ -4,11 +4,9 @@ import {
     ProtocolMessage,
     RainMessage,
     JoinAccept,
-    JoinReject,
     AttachAccept,
     AttachReject,
     SubtreeStatus,
-    GameCmd,
     RebindAssign,
     PeerId
 } from './types.js';
@@ -17,13 +15,12 @@ import {
     RateLimiter,
     GameEventCache,
     PendingAckTracker,
-    shuffleArray,
     createAckMessage,
     createPongMessage,
     createStateMessage,
     createGameEvent
 } from './utils/index.js';
-import { TopologyManager, TopologyNode } from './host/TopologyManager.js';
+import { TopologyManager } from './host/TopologyManager.js';
 
 export class Host {
     private peer: Peer;
@@ -504,6 +501,16 @@ export class Host {
         this.onStateChange = callback;
         this.emitState();
     }
+    public close() {
+        if (this.rainInterval) {
+            clearInterval(this.rainInterval);
+            this.rainInterval = null;
+        }
+        if (this.rateLimiter) {
+            this.rateLimiter.stopCleanup();
+        }
+    }
+
     private emitState() {
         if (this.onStateChange) {
             this.onStateChange({
